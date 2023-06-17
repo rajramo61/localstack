@@ -1,4 +1,5 @@
 import base64
+import inspect
 import json
 import logging
 import re
@@ -72,12 +73,10 @@ ResourceDefinition = dict[str, ResourceProp]
 
 class FuncDetailsValue(TypedDict):
     # Callable here takes the arguments:
-    # - resource_id
-    # - resources
-    # - resource_type
-    # - func
+    # - logical_resource_id
+    # - resource
     # - stack_name
-    function: str | Callable[[str, list[dict], str, Any, str], Any]
+    function: str | Callable[[str, dict, str], Any]
     """Either an api method to call directly with `parameters` or a callable to directly invoke"""
     # Callable here takes the arguments:
     # - resource_props
@@ -172,7 +171,6 @@ def get_client(resource: dict):
 def retrieve_resource_details(
     resource_id, resource_status, resources: dict[str, Type[GenericBaseModel]], stack_name
 ):
-
     resource = resources.get(resource_id)
     resource_id = resource_status.get("PhysicalResourceId") or resource_id
     if not resource:
@@ -812,7 +810,11 @@ def execute_resource_action(
         executed = False
         # TODO(srw) 3 - callable function
         if callable(func.get("function")):
-            result = func["function"](resource_id, resources, resource_type, func, stack_name)
+            sig = inspect.signature(func["function"])
+            if "logical_resource_id" in sig.parameters:
+                result = func["function"](resource_id, resources[resource_id], stack_name)
+            else:
+                result = func["function"](resource_id, resources, resource_type, func, stack_name)
             results.append(result)
             executed = True
 
@@ -973,7 +975,7 @@ def determine_resource_physical_id(
     if resource_class:
         resource_inst = resource_class(resource)
         resource_inst.fetch_state_if_missing(stack_name=stack_name, resources=resources)
-        result = resource_inst.get_physical_resource_id()
+        result = resource_inst.physical_resource_id
         if result:
             return result
 
@@ -1233,6 +1235,18 @@ class TemplateDeployer:
             if physical_id:
                 resource["PhysicalResourceId"] = physical_id
 
+        # Fetch state for compatibility purposes
+        # Since we now have the PhysicalResourceId available without a fetch_state, other attributes that still depend on fetch-state state might not work otherwise
+        if not resource:
+            return
+        resource_type = get_resource_type(resource)
+        resource_class = RESOURCE_MODELS.get(resource_type)
+        if resource_class:
+            resource_inst = resource_class(resource)
+            resource_inst.fetch_state_if_missing(
+                stack_name=stack.stack_name, resources=stack.resources
+            )
+
         # set resource status
         stack.set_resource_status(resource_id, f"{action}_COMPLETE", physical_res_id=physical_id)
 
@@ -1480,6 +1494,24 @@ class TemplateDeployer:
                         e,
                     )
                     j += 1
+                except Exception as e:
+                    status_action = {
+                        "Add": "CREATE",
+                        "Modify": "UPDATE",
+                        "Dynamic": "UPDATE",
+                        "Remove": "DELETE",
+                    }[action]
+                    stack.add_stack_event(
+                        resource_id=resource_id,
+                        physical_res_id=new_resources[resource_id].get("PhysicalResourceId"),
+                        status=f"{status_action}_FAILED",
+                        status_reason=str(e),
+                    )
+                    if config.CFN_VERBOSE_ERRORS:
+                        LOG.exception(
+                            f"Failed to deploy resource {resource_id}, stack deploy failed"
+                        )
+                    raise
             if not changes:
                 break
             if not updated:
