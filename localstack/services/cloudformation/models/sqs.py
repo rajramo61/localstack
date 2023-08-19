@@ -3,13 +3,14 @@ import logging
 
 from botocore.exceptions import ClientError
 
+from localstack.aws.connect import connect_to
 from localstack.services.cloudformation.deployment_utils import (
     generate_default_name,
     params_list_to_dict,
     params_select_attributes,
 )
 from localstack.services.cloudformation.service_models import GenericBaseModel
-from localstack.utils.aws import arns, aws_stack
+from localstack.utils.aws import arns
 from localstack.utils.common import short_uid
 
 LOG = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ class QueuePolicy(GenericBaseModel):
     @classmethod
     def get_deploy_templates(cls):
         def _create(logical_resource_id: str, resource: dict, stack_name: str):
-            sqs_client = aws_stack.connect_to_service("sqs")
+            sqs_client = connect_to().sqs
             resource_provider = cls(resource)
             props = resource_provider.props
 
@@ -42,7 +43,7 @@ class QueuePolicy(GenericBaseModel):
                 sqs_client.set_queue_attributes(QueueUrl=queue, Attributes={"Policy": policy})
 
         def _delete(logical_resource_id: str, resource: dict, stack_name: str):
-            sqs_client = aws_stack.connect_to_service("sqs")
+            sqs_client = connect_to().sqs
             resource_provider = cls(resource)
             props = resource_provider.props
 
@@ -66,14 +67,9 @@ class SQSQueue(GenericBaseModel):
     def cloudformation_type(cls):
         return "AWS::SQS::Queue"
 
-    def get_cfn_attribute(self, attribute_name):
-        if attribute_name == "Arn":
-            return arns.sqs_queue_arn(self.properties["QueueName"])
-        return super().get_cfn_attribute(attribute_name)
-
     def fetch_state(self, stack_name, resources):
         queue_name = self.props["QueueName"]
-        sqs_client = aws_stack.connect_to_service("sqs")
+        sqs_client = connect_to().sqs
         queues = sqs_client.list_queues()
         result = list(
             filter(
@@ -104,18 +100,15 @@ class SQSQueue(GenericBaseModel):
 
     @classmethod
     def get_deploy_templates(cls):
-        def _queue_url(params, resources, resource_id, **kwargs):
-            resource = cls(resources[resource_id])
-            props = resource.props
-            queue_url = resource.physical_resource_id or props.get("QueueUrl")
+        def _queue_url(properties: dict, logical_resource_id: str, resource: dict, stack_name: str):
+            provider = cls(resource)
+            queue_url = provider.physical_resource_id or properties.get("QueueUrl")
             if queue_url:
                 return queue_url
-            return arns.sqs_queue_url_for_arn(props["QueueArn"])
+            return arns.sqs_queue_url_for_arn(properties["QueueArn"])
 
-        def _set_physical_resource_id(
-            result: dict, resource_id: str, resources: dict, resource_type: str
-        ):
-            resources[resource_id]["PhysicalResourceId"] = result["QueueUrl"]
+        def _handle_result(result: dict, logical_resource_id: str, resource: dict):
+            resource["PhysicalResourceId"] = result["QueueUrl"]
 
         return {
             "create": {
@@ -134,7 +127,7 @@ class SQSQueue(GenericBaseModel):
                     ),
                     "tags": params_list_to_dict("Tags"),
                 },
-                "result_handler": _set_physical_resource_id,
+                "result_handler": _handle_result,
             },
             "delete": {
                 "function": "delete_queue",

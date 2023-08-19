@@ -55,6 +55,7 @@ from localstack.aws.api.cloudformation import (
     PhysicalResourceId,
     RegisterTypeInput,
     RegisterTypeOutput,
+    RetainExceptOnCreate,
     RetainResources,
     RoleARN,
     StackName,
@@ -71,6 +72,7 @@ from localstack.aws.api.cloudformation import (
     ValidateTemplateInput,
     ValidateTemplateOutput,
 )
+from localstack.aws.connect import connect_to
 from localstack.services.cloudformation import api_utils
 from localstack.services.cloudformation.engine import parameters as param_resolver
 from localstack.services.cloudformation.engine import template_deployer, template_preparer
@@ -80,16 +82,17 @@ from localstack.services.cloudformation.engine.entities import (
     StackInstance,
     StackSet,
 )
+from localstack.services.cloudformation.engine.parameters import strip_parameter_type
 from localstack.services.cloudformation.engine.template_deployer import NoStackUpdates
 from localstack.services.cloudformation.engine.template_preparer import (
     FailedTransformationException,
 )
+from localstack.services.cloudformation.engine.template_utils import resolve_stack_conditions
 from localstack.services.cloudformation.stores import (
     find_change_set,
     find_stack,
     get_cloudformation_store,
 )
-from localstack.utils.aws import aws_stack
 from localstack.utils.collections import (
     remove_attributes,
     select_attributes,
@@ -189,9 +192,8 @@ class CloudformationProvider(CloudformationApi):
                 "Requires capabilities : [CAPABILITY_AUTO_EXPAND]"
             )
 
-        new_parameters: dict[str, Parameter] = param_resolver.convert_stack_parameters_to_dict(
-            request.get("Parameters")
-        )
+        # resolve stack parameters
+        new_parameters = param_resolver.convert_stack_parameters_to_dict(request.get("Parameters"))
         parameter_declarations = param_resolver.extract_stack_parameter_declarations(template)
         resolved_parameters = param_resolver.resolve_parameters(
             parameter_declarations=parameter_declarations,
@@ -199,11 +201,18 @@ class CloudformationProvider(CloudformationApi):
             old_parameters={},
         )
 
+        # handle conditions
         stack = Stack(request, template)
 
         try:
             template = template_preparer.transform_template(
-                template, list(resolved_parameters.values()), stack.stack_name, stack.resources
+                template,
+                list(resolved_parameters.values()),
+                stack.stack_name,
+                stack.resources,
+                stack.mappings,
+                {},  # TODO
+                resolved_parameters,
             )
         except FailedTransformationException as e:
             stack.add_stack_event(
@@ -217,6 +226,17 @@ class CloudformationProvider(CloudformationApi):
             return CreateStackOutput(StackId=stack.stack_id)
 
         stack = Stack(request, template)
+
+        # resolve conditions
+        raw_conditions = template.get("Conditions", {})
+        resolved_stack_conditions = resolve_stack_conditions(
+            conditions=raw_conditions,
+            parameters=resolved_parameters,
+            mappings=stack.mappings,
+            stack_name=stack_name,
+        )
+        stack.set_resolved_stack_conditions(resolved_stack_conditions)
+
         stack.set_resolved_parameters(resolved_parameters)
         stack.template_body = json.dumps(template)
         state.stacks[stack.stack_id] = stack
@@ -281,9 +301,22 @@ class CloudformationProvider(CloudformationApi):
             old_parameters=stack.resolved_parameters,
         )
 
+        resolved_stack_conditions = resolve_stack_conditions(
+            conditions=template.get("Conditions", {}),
+            parameters=resolved_parameters,
+            mappings=template.get("Mappings", {}),
+            stack_name=stack_name,
+        )
+
         try:
             template = template_preparer.transform_template(
-                template, list(resolved_parameters.values()), stack.stack_name, stack.resources
+                template,
+                list(resolved_parameters.values()),
+                stack.stack_name,
+                stack.resources,
+                stack.mappings,
+                resolved_stack_conditions,
+                resolved_parameters,
             )
         except FailedTransformationException as e:
             stack.add_stack_event(
@@ -300,6 +333,7 @@ class CloudformationProvider(CloudformationApi):
         new_stack = Stack(request, template)
         new_stack.set_resolved_parameters(resolved_parameters)
         stack.set_resolved_parameters(resolved_parameters)
+        stack.set_resolved_stack_conditions(resolved_stack_conditions)
         try:
             deployer.update_stack(new_stack)
         except Exception as e:
@@ -480,7 +514,9 @@ class CloudformationProvider(CloudformationApi):
                 raise ValidationError(
                     f"Stack '{stack_name}' does not exist."
                 )  # stack should exist already
-            old_parameters = stack.resolved_parameters
+            old_parameters = {
+                k: strip_parameter_type(v) for k, v in stack.resolved_parameters.items()
+            }
         elif change_set_type == "CREATE":
             # create new (empty) stack
             if stack is not None:
@@ -506,7 +542,7 @@ class CloudformationProvider(CloudformationApi):
             )
             raise ValidationError(msg)
 
-        # apply template transformations
+        # resolve parameters
         new_parameters: dict[str, Parameter] = param_resolver.convert_stack_parameters_to_dict(
             request.get("Parameters")
         )
@@ -526,14 +562,32 @@ class CloudformationProvider(CloudformationApi):
         temp_stack = Stack(req_params_copy, template)
         temp_stack.set_resolved_parameters(resolved_parameters)
 
+        # TODO: everything below should be async
+        # apply template transformations
         transformed_template = template_preparer.transform_template(
-            template, parameters, stack_name=temp_stack.stack_name, resources=temp_stack.resources
+            template,
+            parameters,
+            stack_name=temp_stack.stack_name,
+            resources=temp_stack.resources,
+            mappings=temp_stack.mappings,
+            conditions={},  # TODO: we don't have any resolved conditions yet at this point but we need the conditions because of the samtranslator...
+            resolved_parameters=resolved_parameters,
         )
 
         # create change set for the stack and apply changes
         change_set = StackChangeSet(stack, req_params, transformed_template)
         # only set parameters for the changeset, then switch to stack on execute_change_set
         change_set.set_resolved_parameters(resolved_parameters)
+
+        # TODO: evaluate conditions
+        raw_conditions = transformed_template.get("Conditions", {})
+        resolved_stack_conditions = resolve_stack_conditions(
+            conditions=raw_conditions,
+            parameters=resolved_parameters,
+            mappings=temp_stack.mappings,
+            stack_name=stack_name,
+        )
+        change_set.set_resolved_stack_conditions(resolved_stack_conditions)
 
         deployer = template_deployer.TemplateDeployer(change_set)
         changes = deployer.construct_changes(
@@ -593,7 +647,8 @@ class CloudformationProvider(CloudformationApi):
             "Transform",
         ]
         result = remove_attributes(deepcopy(change_set.metadata), attrs)
-        # result["Parameters"] = list(change_set.resolved_parameters.values())
+        # TODO: replace this patch with a better solution
+        result["Parameters"] = [strip_parameter_type(p) for p in result.get("Parameters", [])]
         return result
 
     @handler("DeleteChangeSet")
@@ -633,6 +688,7 @@ class CloudformationProvider(CloudformationApi):
         stack_name: StackNameOrId = None,
         client_request_token: ClientRequestToken = None,
         disable_rollback: DisableRollback = None,
+        retain_except_on_create: RetainExceptOnCreate = None,
     ) -> ExecuteChangeSetOutput:
         change_set = find_change_set(change_set_name, stack_name=stack_name)
         if not change_set:
@@ -911,7 +967,7 @@ class CloudformationProvider(CloudformationApi):
             for region in regions:
                 # deploy new stack
                 LOG.debug('Deploying instance for stack set "%s" in region "%s"', set_name, region)
-                cf_client = aws_stack.connect_to_service("cloudformation", region_name=region)
+                cf_client = connect_to(region_name=region).cloudformation
                 kwargs = select_attributes(sset_meta, ["TemplateBody"]) or select_attributes(
                     sset_meta, ["TemplateURL"]
                 )
@@ -938,7 +994,7 @@ class CloudformationProvider(CloudformationApi):
 
         # wait for completion of stack
         for stack in stacks_to_await:
-            client = aws_stack.connect_to_service("cloudformation", region_name=stack[1])
+            client = connect_to(region_name=stack[1]).cloudformation
             client.get_waiter("stack_create_complete").wait(StackName=stack[0])
 
         # record operation

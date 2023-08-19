@@ -8,7 +8,6 @@ import socket
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import boto3
 import botocore.auth
 import botocore.config
 import botocore.credentials
@@ -23,8 +22,6 @@ from pytest_httpserver import HTTPServer
 from werkzeug import Request, Response
 
 from localstack import config, constants
-from localstack.aws.accounts import get_aws_account_id
-from localstack.constants import TEST_AWS_ACCESS_KEY_ID, TEST_AWS_SECRET_ACCESS_KEY
 from localstack.services.stores import (
     AccountRegionBundle,
     BaseStore,
@@ -35,7 +32,6 @@ from localstack.services.stores import (
 from localstack.testing.aws.cloudformation_utils import load_template_file, render_template
 from localstack.testing.aws.util import get_lambda_logs, is_aws_cloud
 from localstack.utils import testutil
-from localstack.utils.aws import aws_stack
 from localstack.utils.aws.client import SigningHttpClient
 from localstack.utils.aws.resources import create_dynamodb_table
 from localstack.utils.collections import ensure_list
@@ -53,47 +49,8 @@ LOG = logging.getLogger(__name__)
 PUBLIC_HTTP_ECHO_SERVER_URL = "http://httpbin.org"
 
 
-def _resource(service):
-    if os.environ.get("TEST_TARGET") == "AWS_CLOUD":
-        return boto3.resource(service)
-    # can't set the timeouts to 0 like in the AWS CLI because the underlying http client requires values > 0
-    config = (
-        botocore.config.Config(
-            connect_timeout=1_000, read_timeout=1_000, retries={"total_max_attempts": 1}
-        )
-        if os.environ.get("TEST_DISABLE_RETRIES_AND_TIMEOUTS")
-        else None
-    )
-    return aws_stack.connect_to_resource_external(service, config=config)
-
-
-# TODO: remove usage of this fixture
 @pytest.fixture(scope="class")
-def create_boto_client(aws_client_factory):
-    def _factory_client(
-        service, region_name=None, aws_access_key_id=None, *, additional_config=None
-    ):
-        return aws_client_factory.get_client(
-            service_name=service, region_name=region_name, config=additional_config
-        )
-
-    return _factory_client
-
-
-@pytest.fixture(scope="class")
-def boto3_session():
-    if os.environ.get("TEST_TARGET", "") == "AWS_CLOUD":
-        return boto3.Session()
-
-    return boto3.Session(
-        # LocalStack assumes AWS_ACCESS_KEY_ID config contains the AWS_ACCOUNT_ID value.
-        aws_access_key_id=get_aws_account_id(),
-        aws_secret_access_key="__test_key__",
-    )
-
-
-@pytest.fixture(scope="class")
-def aws_http_client_factory(boto3_session):
+def aws_http_client_factory(aws_session):
     """
     Returns a factory for creating new ``SigningHttpClient`` instances using a configurable botocore request signer.
     The default signer is a SigV4QueryAuth. The credentials are extracted from the ``boto3_sessions`` fixture that
@@ -120,7 +77,7 @@ def aws_http_client_factory(boto3_session):
         aws_access_key_id: str = None,
         aws_secret_access_key: str = None,
     ):
-        region = region or boto3_session.region_name
+        region = region or aws_session.region_name
         region = region or config.DEFAULT_REGION
 
         if aws_access_key_id or aws_secret_access_key:
@@ -128,16 +85,14 @@ def aws_http_client_factory(boto3_session):
                 access_key=aws_access_key_id, secret_key=aws_secret_access_key
             )
         else:
-            credentials = boto3_session.get_credentials()
+            credentials = aws_session.get_credentials()
 
         creds = credentials.get_frozen_credentials()
 
         if not endpoint_url:
             if os.environ.get("TEST_TARGET", "") == "AWS_CLOUD":
                 # FIXME: this is a bit raw. we should probably re-use boto in a better way
-                resolver: EndpointResolver = boto3_session._session.get_component(
-                    "endpoint_resolver"
-                )
+                resolver: EndpointResolver = aws_session._session.get_component("endpoint_resolver")
                 endpoint_url = "https://" + resolver.construct_endpoint(service, region)["hostname"]
             else:
                 endpoint_url = config.get_edge_url()
@@ -148,26 +103,8 @@ def aws_http_client_factory(boto3_session):
 
 
 @pytest.fixture(scope="class")
-def dynamodb_resource():
-    return _resource("dynamodb")
-
-
-@pytest.fixture(scope="class")
 def s3_vhost_client(aws_client_factory):
     return aws_client_factory(config=botocore.config.Config(s3={"addressing_style": "virtual"})).s3
-
-
-# TODO: remove
-@pytest.fixture(scope="class")
-def s3_presigned_client(aws_client_factory):
-    return aws_client_factory(
-        aws_access_key_id=TEST_AWS_ACCESS_KEY_ID, aws_secret_access_key=TEST_AWS_SECRET_ACCESS_KEY
-    ).s3
-
-
-@pytest.fixture(scope="class")
-def s3_resource():
-    return _resource("s3")
 
 
 @pytest.fixture
@@ -237,7 +174,7 @@ def dynamodb_create_table(dynamodb_wait_for_table_active, aws_client):
 
 
 @pytest.fixture
-def s3_create_bucket(s3_resource, aws_client):
+def s3_create_bucket(s3_empty_bucket, aws_client):
     buckets = []
 
     def factory(**kwargs) -> str:
@@ -261,10 +198,8 @@ def s3_create_bucket(s3_resource, aws_client):
     # cleanup
     for bucket in buckets:
         try:
-            bucket = s3_resource.Bucket(bucket)
-            bucket.objects.all().delete()
-            bucket.object_versions.all().delete()
-            bucket.delete()
+            s3_empty_bucket(bucket)
+            aws_client.s3.delete_bucket(Bucket=bucket)
         except Exception as e:
             LOG.debug("error cleaning up bucket %s: %s", bucket, e)
 
@@ -276,6 +211,36 @@ def s3_bucket(s3_create_bucket, aws_client) -> str:
     if region != "us-east-1":
         kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
     return s3_create_bucket(**kwargs)
+
+
+@pytest.fixture
+def s3_empty_bucket(aws_client):
+    """
+    Returns a factory that given a bucket name, deletes all objects and deletes all object versions
+    """
+    # Boto resource would make this a straightforward task, but our internal client does not support Boto resource
+    # FIXME: this won't work when bucket has more than 1000 objects
+    def factory(bucket_name: str):
+        response = aws_client.s3.list_objects_v2(Bucket=bucket_name)
+        objects = [{"Key": obj["Key"]} for obj in response.get("Contents", [])]
+        if objects:
+            aws_client.s3.delete_objects(
+                Bucket=bucket_name, Delete={"Objects": objects}, BypassGovernanceRetention=True
+            )
+
+        response = aws_client.s3.list_object_versions(Bucket=bucket_name)
+        versions = response.get("Versions", [])
+        versions.extend(response.get("DeleteMarkers", []))
+
+        object_versions = [{"Key": obj["Key"], "VersionId": obj["VersionId"]} for obj in versions]
+        if object_versions:
+            aws_client.s3.delete_objects(
+                Bucket=bucket_name,
+                Delete={"Objects": object_versions},
+                BypassGovernanceRetention=True,
+            )
+
+    yield factory
 
 
 @pytest.fixture
@@ -693,22 +658,25 @@ def wait_for_dynamodb_stream_ready(aws_client):
 
 
 @pytest.fixture()
-def kms_create_key(create_boto_client):
+def kms_create_key(aws_client_factory):
     key_ids = []
 
-    def _create_key(region=None, **kwargs):
+    def _create_key(region_name: str = None, **kwargs):
         if "Description" not in kwargs:
             kwargs["Description"] = f"test description - {short_uid()}"
-        key_metadata = create_boto_client("kms", region).create_key(**kwargs)["KeyMetadata"]
-        key_ids.append((region, key_metadata["KeyId"]))
+        key_metadata = aws_client_factory(region_name=region_name).kms.create_key(**kwargs)[
+            "KeyMetadata"
+        ]
+        key_ids.append((region_name, key_metadata["KeyId"]))
         return key_metadata
 
     yield _create_key
 
-    for region, key_id in key_ids:
+    for region_name, key_id in key_ids:
         try:
+
             # shortest amount of time you can schedule the deletion
-            create_boto_client("kms", region).schedule_key_deletion(
+            aws_client_factory(region_name=region_name).kms.schedule_key_deletion(
                 KeyId=key_id, PendingWindowInDays=7
             )
         except Exception as e:
@@ -722,20 +690,20 @@ def kms_create_key(create_boto_client):
 
 
 @pytest.fixture()
-def kms_replicate_key(create_boto_client):
+def kms_replicate_key(aws_client_factory):
     key_ids = []
 
     def _replicate_key(region_from=None, **kwargs):
         region_to = kwargs.get("ReplicaRegion")
         key_ids.append((region_to, kwargs.get("KeyId")))
-        return create_boto_client("kms", region_from).replicate_key(**kwargs)
+        return aws_client_factory(region_name=region_from).kms.replicate_key(**kwargs)
 
     yield _replicate_key
 
     for region_to, key_id in key_ids:
         try:
             # shortest amount of time you can schedule the deletion
-            create_boto_client("kms", region_to).schedule_key_deletion(
+            aws_client_factory(region_name=region_to).kms.schedule_key_deletion(
                 KeyId=key_id, PendingWindowInDays=7
             )
         except Exception as e:
@@ -1145,7 +1113,7 @@ def is_change_set_finished(aws_client):
 @pytest.fixture
 def wait_until_lambda_ready(aws_client):
     def _wait_until_ready(function_name: str, qualifier: str = None, client=None):
-        client = client or aws_client.awslambda
+        client = client or aws_client.lambda_
 
         def _is_not_pending():
             kwargs = {}
@@ -1208,13 +1176,13 @@ def create_lambda_function_aws(aws_client):
 
     def _create_lambda_function(**kwargs):
         def _create_function():
-            resp = aws_client.awslambda.create_function(**kwargs)
+            resp = aws_client.lambda_.create_function(**kwargs)
             lambda_arns.append(resp["FunctionArn"])
 
             def _is_not_pending():
                 try:
                     result = (
-                        aws_client.awslambda.get_function(FunctionName=resp["FunctionName"])[
+                        aws_client.lambda_.get_function(FunctionName=resp["FunctionName"])[
                             "Configuration"
                         ]["State"]
                         != "Pending"
@@ -1235,7 +1203,7 @@ def create_lambda_function_aws(aws_client):
 
     for arn in lambda_arns:
         try:
-            aws_client.awslambda.delete_function(FunctionName=arn)
+            aws_client.lambda_.delete_function(FunctionName=arn)
         except Exception:
             LOG.debug(f"Unable to delete function {arn=} in cleanup")
 
@@ -1244,12 +1212,14 @@ def create_lambda_function_aws(aws_client):
 def create_lambda_function(aws_client, wait_until_lambda_ready, lambda_su_role):
     lambda_arns_and_clients = []
     log_groups = []
-    lambda_client = aws_client.awslambda
+    lambda_client = aws_client.lambda_
     logs_client = aws_client.logs
+    s3_client = aws_client.s3
 
     def _create_lambda_function(*args, **kwargs):
         client = kwargs.get("client") or lambda_client
         kwargs["client"] = client
+        kwargs["s3_client"] = s3_client
         func_name = kwargs.get("func_name")
         assert func_name
         del kwargs["func_name"]
@@ -1759,17 +1729,12 @@ def cleanups(aws_client):
 
 @pytest.fixture(scope="session")
 def account_id(aws_client):
-    sts_client = aws_client.sts
-    return sts_client.get_caller_identity()["Account"]
+    return aws_client.sts.get_caller_identity()["Account"]
 
 
-@pytest.hookimpl
-def pytest_configure(config: Config):
-    # TODO: migrate towards "whitebox" or similar structure
-    config.addinivalue_line(
-        "markers",
-        "only_localstack: mark the test as incompatible with AWS / can't be run with AWS_CLOUD target",
-    )
+@pytest.fixture(scope="session")
+def secondary_account_id(secondary_aws_client):
+    return secondary_aws_client.sts.get_caller_identity()["Account"]
 
 
 @pytest.hookimpl
@@ -1810,6 +1775,7 @@ def create_rest_apigw(aws_client_factory):
     def _create_apigateway_function(**kwargs):
         region_name = kwargs.pop("region_name", None)
         apigateway_client = aws_client_factory(region_name=region_name).apigateway
+        kwargs.setdefault("name", f"api-{short_uid()}")
 
         response = apigateway_client.create_rest_api(**kwargs)
         api_id = response.get("id")
@@ -1840,7 +1806,6 @@ def create_rest_apigw(aws_client_factory):
         for usage_plan_id in usage_plan_ids:
             usage_plan_keys = apigateway_client.get_usage_plan_keys(usagePlanId=usage_plan_id)
             for key in usage_plan_keys.get("items", []):
-
                 apigateway_client.delete_api_key(apiKey=key["id"])
             apigateway_client.delete_usage_plan(usagePlanId=usage_plan_id)
 

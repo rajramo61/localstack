@@ -44,7 +44,13 @@ state_stmt
     | timestamp_path_decl
     | items_path_decl
     | item_processor_decl
+    | iterator_decl
+    | item_selector_decl
     | max_concurrency_decl
+    | timeout_seconds_decl
+    | timeout_seconds_path_decl
+    | heartbeat_seconds_decl
+    | heartbeat_seconds_path_decl
     | branches_decl
     | parameters_decl
     | retry_decl
@@ -147,6 +153,22 @@ max_concurrency_decl
 
 parameters_decl
     : PARAMETERS COLON payload_tmpl_decl
+    ;
+
+timeout_seconds_decl
+    : TIMEOUTSECONDS COLON INT
+    ;
+
+timeout_seconds_path_decl
+    : TIMEOUTSECONDSPATH COLON STRINGPATH
+    ;
+
+heartbeat_seconds_decl
+    : HEARTBEATSECONDS COLON INT
+    ;
+
+heartbeat_seconds_path_decl
+    : HEARTBEATSECONDSPATH COLON STRINGPATH
     ;
 
 payload_tmpl_decl
@@ -280,6 +302,24 @@ processor_config_decl
       RBRACE
     ;
 
+iterator_decl
+    : ITERATOR
+      COLON
+      LBRACE
+      iterator_decl_item (COMMA iterator_decl_item)*
+      RBRACE
+    ;
+
+iterator_decl_item
+    : startat_decl
+    | states_decl
+    | comment_decl
+    ;
+
+item_selector_decl
+    : ITEMSELECTOR COLON payload_tmpl_decl
+    ;
+
 mode_decl
     : MODE COLON mode_type
     ;
@@ -292,7 +332,7 @@ retry_decl
     : RETRY
       COLON
       LBRACK
-      retrier_decl (COMMA retry_decl)*
+      retrier_decl (COMMA retrier_decl)*
       RBRACK
     ;
 
@@ -326,7 +366,7 @@ max_attempts_decl
     ;
 
 backoff_rate_decl
-    : BACKOFFRATE COLON NUMBER
+    : BACKOFFRATE COLON (INT | NUMBER)
     ;
 
 catch_decl
@@ -455,6 +495,7 @@ keyword_or_string // TODO: check keywords can be used as strings.
     | STARTAT
     | NEXTSTATE
     | TYPE
+    | PASS
     | TASK
     | CHOICE
     | CHOICES

@@ -3,8 +3,9 @@ from typing import Optional, TypedDict
 
 from localstack.aws.api.cloudformation import Capability, ChangeSetType, Parameter
 from localstack.services.cloudformation.engine.parameters import (
+    StackParameter,
     convert_stack_parameters_to_list,
-    map_to_legacy_structure,
+    strip_parameter_type,
 )
 from localstack.utils.aws import arns
 from localstack.utils.collections import select_attributes
@@ -69,7 +70,8 @@ class Stack:
             template = {}
 
         self.resolved_outputs = list()  # TODO
-        self.resolved_parameters: dict[str, Parameter] = {}
+        self.resolved_parameters: dict[str, StackParameter] = {}
+        self.resolved_conditions: dict[str, bool] = {}
 
         self.metadata = metadata or {}
         self.template = template or {}
@@ -104,11 +106,15 @@ class Stack:
         self.events = []
         # list of stack change sets
         self.change_sets = []
+        # self.evaluated_conditions = {}
 
-    def set_resolved_parameters(self, resolved_parameters: dict[str, Parameter]):
+    def set_resolved_parameters(self, resolved_parameters: dict[str, StackParameter]):
         self.resolved_parameters = resolved_parameters
         if resolved_parameters:
             self.metadata["Parameters"] = list(resolved_parameters.values())
+
+    def set_resolved_stack_conditions(self, resolved_conditions: dict[str, bool]):
+        self.resolved_conditions = resolved_conditions
 
     def describe_details(self):
         attrs = [
@@ -137,18 +143,20 @@ class Stack:
             result["Outputs"] = outputs
         stack_parameters = convert_stack_parameters_to_list(self.resolved_parameters)
         if stack_parameters:
-            result["Parameters"] = stack_parameters
+            result["Parameters"] = [strip_parameter_type(sp) for sp in stack_parameters]
         if not result.get("DriftInformation"):
             result["DriftInformation"] = {"StackDriftStatus": "NOT_CHECKED"}
         for attr in ["Tags", "NotificationARNs"]:
             result.setdefault(attr, [])
         return result
 
-    def set_stack_status(self, status):
+    def set_stack_status(self, status: str, status_reason: Optional[str] = None):
         self.metadata["StackStatus"] = status
         if "FAILED" in status:
-            self.metadata["StackStatusReason"] = "Deployment failed"
-        self.add_stack_event(self.stack_name, self.stack_id, status)
+            self.metadata["StackStatusReason"] = status_reason or "Deployment failed"
+        self.add_stack_event(
+            self.stack_name, self.stack_id, status, status_reason=status_reason or ""
+        )
 
     def set_time_attribute(self, attribute, new_time=None):
         self.metadata[attribute] = new_time or timestamp_millis()
@@ -184,8 +192,9 @@ class Stack:
 
         self.events.insert(0, event)
 
-    def set_resource_status(self, resource_id: str, status: str, physical_res_id: str = None):
+    def set_resource_status(self, resource_id: str, status: str):
         """Update the deployment status of the given resource ID and publish a corresponding stack event."""
+        physical_res_id = self.resources.get(resource_id, {}).get("PhysicalResourceId")
         self._set_resource_status_details(resource_id, physical_res_id=physical_res_id)
         state = self.resource_states.setdefault(resource_id, {})
         state["PreviousResourceStatus"] = state.get("ResourceStatus")
@@ -237,33 +246,10 @@ class Stack:
     def stack_id(self):
         return self.metadata["StackId"]
 
-    # TODO: potential performance issues due to many stack_parameters calls (cache or limit actual invocations)
     @property
-    def resources(self):  # TODO: not actually resources, split apart
-        """Return dict of resources, parameters, conditions, and other stack metadata."""
-        result = dict(self.template_resources)
-
-        result.update(
-            {k: map_to_legacy_structure(k, v) for k, v in self.resolved_parameters.items()}
-        )
-
-        # TODO: conditions and mappings don't really belong here and should be handled separately
-        for name, value in self.conditions.items():
-            if name not in result:
-                result[name] = {
-                    "Type": "Parameter",
-                    "LogicalResourceId": name,
-                    "Properties": {"Value": value},
-                }
-        for name, value in self.mappings.items():
-            if name not in result:
-                result[name] = {
-                    "Type": "Parameter",
-                    "LogicalResourceId": name,
-                    "Properties": {"Value": value},
-                }
-
-        return result
+    def resources(self):
+        """Return dict of resources"""
+        return dict(self.template_resources)
 
     @property
     def template_resources(self):

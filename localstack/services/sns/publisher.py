@@ -25,7 +25,6 @@ from localstack.services.sns.models import (
     SnsStore,
     SnsSubscription,
 )
-from localstack.utils.aws import aws_stack
 from localstack.utils.aws.arns import (
     extract_region_from_arn,
     extract_resource_from_arn,
@@ -168,7 +167,7 @@ class LambdaTopicPublisher(TopicPublisher):
     def _publish(self, context: SnsPublishContext, subscriber: SnsSubscription):
         try:
             region = extract_region_from_arn(subscriber["Endpoint"])
-            lambda_client = connect_to(region_name=region).awslambda.request_metadata(
+            lambda_client = connect_to(region_name=region).lambda_.request_metadata(
                 source_arn=subscriber["TopicArn"], service_principal="sns"
             )
             event = self.prepare_message(context.message, subscriber)
@@ -544,9 +543,9 @@ class SmsTopicPublisher(TopicPublisher):
         context.store.sms_messages.append(event)
         LOG.info(
             "Delivering SMS message to %s: %s from topic: %s",
-            event["endpoint"],
-            event["message_content"],
-            event["topic_arn"],
+            event["PhoneNumber"],
+            event["Message"],
+            event["TopicArn"],
         )
 
         # MOCK DATA
@@ -563,9 +562,14 @@ class SmsTopicPublisher(TopicPublisher):
 
     def prepare_message(self, message_context: SnsMessage, subscriber: SnsSubscription) -> dict:
         return {
-            "topic_arn": subscriber["TopicArn"],
-            "endpoint": subscriber["Endpoint"],
-            "message_content": message_context.message_content(subscriber["Protocol"]),
+            "PhoneNumber": subscriber["Endpoint"],
+            "TopicArn": subscriber["TopicArn"],
+            "SubscriptionArn": subscriber["SubscriptionArn"],
+            "MessageId": message_context.message_id,
+            "Message": message_context.message_content(protocol=subscriber["Protocol"]),
+            "MessageAttributes": message_context.message_attributes,
+            "MessageStructure": message_context.message_structure,
+            "Subject": message_context.subject,
         }
 
 
@@ -616,8 +620,8 @@ class SmsPhoneNumberPublisher(EndpointPublisher):
         context.store.sms_messages.append(event)
         LOG.info(
             "Delivering SMS message to %s: %s",
-            event["endpoint"],
-            event["message_content"],
+            event["PhoneNumber"],
+            event["Message"],
         )
 
         # TODO: check about delivery logs for individual call, need a real AWS test
@@ -625,9 +629,14 @@ class SmsPhoneNumberPublisher(EndpointPublisher):
 
     def prepare_message(self, message_context: SnsMessage, endpoint: str) -> dict:
         return {
-            "topic_arn": None,
-            "endpoint": endpoint,
-            "message_content": message_context.message_content("sms"),
+            "PhoneNumber": endpoint,
+            "TopicArn": None,
+            "SubscriptionArn": None,
+            "MessageId": message_context.message_id,
+            "Message": message_context.message_content(protocol="sms"),
+            "MessageAttributes": message_context.message_attributes,
+            "MessageStructure": message_context.message_structure,
+            "Subject": message_context.subject,
         }
 
 
@@ -705,7 +714,7 @@ def get_attributes_for_application_endpoint(endpoint_arn: str) -> Tuple[Dict, Di
     :param endpoint_arn:
     :return:
     """
-    sns_client = aws_stack.connect_to_service("sns")
+    sns_client = connect_to().sns
     # TODO: we should access this from the moto store directly
     endpoint_attributes = sns_client.get_endpoint_attributes(EndpointArn=endpoint_arn)
 

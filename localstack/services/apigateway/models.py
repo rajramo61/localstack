@@ -5,6 +5,8 @@ from requests.structures import CaseInsensitiveDict
 from localstack.aws.api.apigateway import (
     Authorizer,
     DocumentationPart,
+    DocumentationVersion,
+    DomainName,
     GatewayResponse,
     Model,
     RequestValidator,
@@ -28,6 +30,8 @@ class RestApiContainer:
     validators: Dict[str, RequestValidator]
     # map DocumentationPartId -> DocumentationPart
     documentation_parts: Dict[str, DocumentationPart]
+    # map doc version name -> DocumentationVersion
+    documentation_versions: Dict[str, DocumentationVersion]
     # not used yet, still in moto
     gateway_responses: Dict[str, GatewayResponse]
     # maps Model name -> Model
@@ -42,6 +46,7 @@ class RestApiContainer:
         self.authorizers = {}
         self.validators = {}
         self.documentation_parts = {}
+        self.documentation_versions = {}
         self.gateway_responses = {}
         self.models = {}
         self.resolved_models = {}
@@ -64,6 +69,9 @@ class ApiGatewayStore(BaseStore):
 
     # maps cert ID to client certificate details
     client_certificates: Dict[str, Dict] = LocalAttribute(default=dict)
+
+    # maps domain name to domain name model
+    domain_names: Dict[str, DomainName] = LocalAttribute(default=dict)
 
     # maps resource ARN to tags
     TAGS: Dict[str, Dict[str, str]] = CrossRegionAttribute(default=dict)

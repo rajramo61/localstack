@@ -2,10 +2,12 @@ import json
 import logging
 import os
 import sys
-from typing import Dict, List, Optional
+import traceback
+from typing import Dict, List, Optional, Tuple
 
 from localstack import config
 from localstack.utils.analytics.cli import publish_invocation
+from localstack.utils.json import CustomEncoder
 
 if sys.version_info >= (3, 8):
     from typing import TypedDict
@@ -18,6 +20,45 @@ from localstack import __version__
 
 from .console import BANNER, console
 from .plugin import LocalstackCli, load_cli_plugins
+
+
+class ExceptionCmdHandler(click.Group):
+    """
+    A Click group implementation which globally handles exceptions by:
+    - Ignoring click exceptions (already handled)
+    - Handling common exceptions (like DockerNotAvailable)
+    - Wrapping all unexpected exceptions in a ClickException (for a unified error message)
+    """
+
+    def invoke(self, ctx: click.Context):
+        try:
+            return super(ExceptionCmdHandler, self).invoke(ctx)
+        except click.exceptions.Exit:
+            # raise Exit exceptions unmodified (e.g., raised on --help)
+            raise
+        except click.ClickException:
+            # don't handle ClickExceptions, just reraise
+            if ctx and ctx.params.get("debug"):
+                click.echo(traceback.format_exc())
+            raise
+        except Exception as e:
+            if ctx and ctx.params.get("debug"):
+                click.echo(traceback.format_exc())
+            from localstack.utils.container_utils.container_client import (
+                ContainerException,
+                DockerNotAvailable,
+            )
+
+            if isinstance(e, DockerNotAvailable):
+                raise click.ClickException(
+                    "Docker could not be found on the system.\n"
+                    "Please make sure that you have a working docker environment on your machine."
+                )
+            elif isinstance(e, ContainerException):
+                raise click.ClickException(e.message)
+            else:
+                # If we have a generic exception, we wrap it in a ClickException
+                raise click.ClickException(str(e)) from e
 
 
 def create_with_plugins() -> LocalstackCli:
@@ -54,6 +95,7 @@ _click_format_option = click.option(
 @click.group(
     name="localstack",
     help="The LocalStack Command Line Interface (CLI)",
+    cls=ExceptionCmdHandler,
     context_settings={
         # add "-h" as a synonym for "--help"
         # https://click.palletsprojects.com/en/8.1.x/documentation/#help-parameter-customization
@@ -149,19 +191,13 @@ def cmd_config_validate(file: str) -> None:
     - The docker-compose file is syntactically incorrect.
     - If the file contains common issues when configuring LocalStack.
     """
-    from rich.panel import Panel
 
     from localstack.utils import bootstrap
 
-    try:
-        if bootstrap.validate_localstack_config(file):
-            console.print("[green]:heavy_check_mark:[/green] config valid")
-            sys.exit(0)
-        else:
-            console.print("[red]:heavy_multiplication_x:[/red] validation error")
-            sys.exit(1)
-    except Exception as e:
-        console.print(Panel(str(e), title="[red]Error[/red]", expand=False))
+    if bootstrap.validate_localstack_config(file):
+        console.print("[green]:heavy_check_mark:[/green] config valid")
+        sys.exit(0)
+    else:
         console.print("[red]:heavy_multiplication_x:[/red] validation error")
         sys.exit(1)
 
@@ -169,7 +205,7 @@ def cmd_config_validate(file: str) -> None:
 def _print_config_json() -> None:
     import json
 
-    console.print(json.dumps(dict(config.collect_config_items())))
+    console.print(json.dumps(dict(config.collect_config_items()), cls=CustomEncoder))
 
 
 def _print_config_pairs() -> None:
@@ -307,11 +343,9 @@ def cmd_status_services(format_: str) -> None:
         if format_ == "json":
             console.print(json.dumps(services))
     except requests.ConnectionError:
-        error = f"could not connect to LocalStack health endpoint at {url}"
-        print_error(format_, error)
         if config.DEBUG:
             console.print_exception()
-        sys.exit(1)
+        raise click.ClickException(f"could not connect to LocalStack health endpoint at {url}")
 
 
 def _print_service_table(services: Dict[str, str]) -> None:
@@ -347,8 +381,23 @@ def _print_service_table(services: Dict[str, str]) -> None:
 @click.option(
     "-d", "--detached", is_flag=True, help="Start LocalStack in the background", default=False
 )
+@click.option(
+    "--network",
+    type=str,
+    help="The container network the LocalStack container should be started in. By default, the default docker bridge network is used.",
+    required=False,
+)
+@click.option(
+    "--env",
+    "-e",
+    help="Additional environment variables that are passed to the LocalStack container",
+    multiple=True,
+    required=False,
+)
 @publish_invocation
-def cmd_start(docker: bool, host: bool, no_banner: bool, detached: bool) -> None:
+def cmd_start(
+    docker: bool, host: bool, no_banner: bool, detached: bool, network: str = None, env: Tuple = ()
+) -> None:
     """
     Start the LocalStack runtime.
 
@@ -375,12 +424,10 @@ def cmd_start(docker: bool, host: bool, no_banner: bool, detached: bool) -> None
         else:
             console.log("starting LocalStack in Docker mode :whale:")
 
-    bootstrap.prepare_host(console)
-
-    if not no_banner and not detached:
-        console.rule("LocalStack Runtime Log (press [bold][yellow]CTRL-C[/yellow][/bold] to quit)")
-
     if host:
+        # call hooks to prepare host
+        bootstrap.prepare_host(console)
+
         # from here we abandon the regular CLI control path and start treating the process like a localstack
         # runtime process
         os.environ["LOCALSTACK_CLI"] = "0"
@@ -403,10 +450,29 @@ def cmd_start(docker: bool, host: bool, no_banner: bool, detached: bool) -> None
         config.is_in_docker = False
         config.dirs = config.init_directories()
 
+        # call hooks to prepare host (note that this call should stay below the config overrides above)
+        bootstrap.prepare_host(console)
+
+        # pass the parsed cli params to the start infra command
+        params = click.get_current_context().params
+
+        if network:
+            # reconciles the network config and makes sure that MAIN_DOCKER_NETWORK is set automatically if
+            # `--network` is set.
+            if config.MAIN_DOCKER_NETWORK:
+                if config.MAIN_DOCKER_NETWORK != network:
+                    raise click.ClickException(
+                        f"Values of MAIN_DOCKER_NETWORK={config.MAIN_DOCKER_NETWORK} and --network={network} "
+                        f"do not match"
+                    )
+            else:
+                config.MAIN_DOCKER_NETWORK = network
+                os.environ["MAIN_DOCKER_NETWORK"] = network
+
         if detached:
-            bootstrap.start_infra_in_docker_detached(console)
+            bootstrap.start_infra_in_docker_detached(console, params)
         else:
-            bootstrap.start_infra_in_docker()
+            bootstrap.start_infra_in_docker(console, params)
 
 
 @localstack.command(name="stop", short_help="Stop LocalStack")
@@ -431,8 +497,9 @@ def cmd_stop() -> None:
         DOCKER_CLIENT.stop_container(container_name)
         console.print("container stopped: %s" % container_name)
     except NoSuchContainer:
-        console.print("no such container: %s" % container_name)
-        sys.exit(1)
+        raise click.ClickException(
+            f'Expected a running LocalStack container named "{container_name}", but found none'
+        )
 
 
 @localstack.command(
@@ -539,7 +606,7 @@ def cmd_ssh() -> None:
 
     if not DOCKER_CLIENT.is_container_running(config.MAIN_CONTAINER_NAME):
         raise click.ClickException(
-            'Expected a running container named "%s", but found none' % config.MAIN_CONTAINER_NAME
+            f'Expected a running LocalStack container named "{config.MAIN_CONTAINER_NAME}", but found none'
         )
     try:
         process = run("docker exec -it %s bash" % config.MAIN_CONTAINER_NAME, tty=True)
@@ -585,12 +652,10 @@ def cmd_update_localstack_cli() -> None:
     """
     if is_frozen_bundle():
         # "update" can only be performed if running from source / in a non-frozen interpreter
-        console.print(
-            ":heavy_multiplication_x: The LocalStack CLI can only update itself if installed via PIP. "
-            "Please follow the instructions on https://docs.localstack.cloud/ to update your CLI.",
-            style="bold red",
+        raise click.ClickException(
+            "The LocalStack CLI can only update itself if installed via PIP. "
+            "Please follow the instructions on https://docs.localstack.cloud/ to update your CLI."
         )
-        sys.exit(1)
 
     import subprocess
     from subprocess import CalledProcessError
@@ -624,8 +689,6 @@ def cmd_update_docker_images() -> None:
     all_images = DOCKER_CLIENT.get_docker_image_names(strip_latest=False)
     image_prefixes = [
         "localstack/",
-        "lambci/lambda:",
-        "mlupin/docker-lambda:",
         "public.ecr.aws/lambda",
     ]
     localstack_images = [
@@ -768,18 +831,6 @@ def print_profile() -> None:
         console.print(
             f" :bust_in_silhouette: [bold]Profile:[/bold] [blue]{config.LOADED_PROFILE}[/blue]"
         )
-
-
-def print_error(format_: str, error: str) -> None:
-    if format_ == "table":
-        symbol = "[bold][red]:heavy_multiplication_x: ERROR[/red][/bold]"
-        console.print(f"{symbol}: {error}")
-    if format_ == "plain":
-        console.print(f"error={error}")
-    if format_ == "dict":
-        console.print({"error": error})
-    if format_ == "json":
-        console.print(json.dumps({"error": error}))
 
 
 def print_banner() -> None:

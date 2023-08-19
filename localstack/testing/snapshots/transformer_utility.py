@@ -251,7 +251,14 @@ class TransformerUtility:
         """
         :return: array with Transformers, for iam api.
         """
-        return [TransformerUtility.key_value("UserName"), TransformerUtility.key_value("UserId")]
+        return [
+            TransformerUtility.key_value("UserName"),
+            TransformerUtility.key_value("UserId"),
+            TransformerUtility.key_value("RoleId"),
+            TransformerUtility.key_value("RoleName"),
+            TransformerUtility.key_value("PolicyName"),
+            TransformerUtility.key_value("PolicyId"),
+        ]
 
     @staticmethod
     def transcribe_api():
@@ -317,6 +324,32 @@ class TransformerUtility:
                 "version-id",
                 reference_replacement=False,
             ),
+        ]
+
+    @staticmethod
+    def s3_dynamodb_notifications():
+        return [
+            TransformerUtility.jsonpath("$..uuid.S", "uuid"),
+            TransformerUtility.jsonpath("$..M.requestParameters.M.sourceIPAddress.S", "ip-address"),
+            TransformerUtility.jsonpath(
+                "$..M.responseElements.M.x-amz-id-2.S", "amz-id", reference_replacement=False
+            ),
+            TransformerUtility.jsonpath(
+                "$..M.responseElements.M.x-amz-request-id.S",
+                "amz-request-id",
+                reference_replacement=False,
+            ),
+            TransformerUtility.jsonpath("$..M.s3.M.bucket.M.name.S", "bucket-name"),
+            TransformerUtility.jsonpath("$..M.s3.M.bucket.M.arn.S", "bucket-arn"),
+            TransformerUtility.jsonpath(
+                "$..M.s3.M.bucket.M.ownerIdentity.M.principalId.S", "principal-id"
+            ),
+            TransformerUtility.jsonpath("$..M.s3.M.configurationId.S", "config-id"),
+            TransformerUtility.jsonpath("$..M.s3.M.object.M.key.S", "object-key"),
+            TransformerUtility.jsonpath(
+                "$..M.s3.M.object.M.sequencer.S", "sequencer", reference_replacement=False
+            ),
+            TransformerUtility.jsonpath("$..M.userIdentity.M.principalId.S", "principal-id"),
         ]
 
     @staticmethod
@@ -525,6 +558,31 @@ class TransformerUtility:
         arn_part_repl = f"<ExecArnPart_{index}idx>"
         arn_part: str = "".join(start_exec["executionArn"].rpartition(":")[-1])
         return RegexTransformer(arn_part, arn_part_repl)
+
+    @staticmethod
+    def stepfunctions_api():
+        return [
+            JsonpathTransformer(
+                "$..SdkHttpMetadata.AllHttpHeaders.Date",
+                "date",
+                replace_reference=False,
+            ),
+            JsonpathTransformer(
+                "$..SdkHttpMetadata.AllHttpHeaders.X-Amzn-Trace-Id",
+                "X-Amzn-Trace-Id",
+                replace_reference=False,
+            ),
+            JsonpathTransformer(
+                "$..SdkHttpMetadata.HttpHeaders.Date",
+                "date",
+                replace_reference=False,
+            ),
+            JsonpathTransformer(
+                "$..SdkHttpMetadata.HttpHeaders.X-Amzn-Trace-Id",
+                "X-Amzn-Trace-Id",
+                replace_reference=False,
+            ),
+        ]
 
     # TODO add example
     # @staticmethod

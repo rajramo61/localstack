@@ -1,8 +1,8 @@
 import logging
 from typing import Dict, Type, Union
 
+from localstack.aws.connect import connect_to
 from localstack.utils import testutil
-from localstack.utils.aws import aws_stack
 from localstack.utils.objects import recurse_object
 
 LOG = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ class AwsIncludeTransformer(Transformer):
 
         location = parameters.get("Location")
         if location and location.startswith("s3://"):
-            s3_client = aws_stack.connect_to_resource("s3")
+            s3_client = connect_to().s3
             bucket, _, path = location.removeprefix("s3://").partition("/")
             content = testutil.download_s3_object(s3_client, bucket, path)
             content = parse_template(content)
@@ -39,7 +39,14 @@ class AwsIncludeTransformer(Transformer):
 transformers: Dict[str, Type] = {"AWS::Include": AwsIncludeTransformer}
 
 
-def apply_transform_intrinsic_functions(template: dict, stack_name: str, resources: dict) -> dict:
+def apply_transform_intrinsic_functions(
+    template: dict,
+    stack_name: str,
+    resources: dict,
+    mappings: dict,
+    conditions: dict[str, bool],
+    stack_parameters: dict,
+) -> dict:
     """Resolve constructs using the 'Fn::Transform' intrinsic function."""
     from localstack.services.cloudformation.engine.template_deployer import resolve_refs_recursively
 
@@ -51,7 +58,9 @@ def apply_transform_intrinsic_functions(template: dict, stack_name: str, resourc
             if transformer_class:
                 transformer = transformer_class()
                 parameters = transform.get("Parameters") or {}
-                parameters = resolve_refs_recursively(stack_name, resources, parameters)
+                parameters = resolve_refs_recursively(
+                    stack_name, resources, mappings, conditions, stack_parameters, parameters
+                )
                 return transformer.transform(parameters)
         return obj
 

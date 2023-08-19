@@ -1,5 +1,5 @@
 # builder: Stage to build a custom JRE (with jlink)
-FROM python:3.10.11-slim-bullseye@sha256:fd86924ba14682eb11a3c244f60a35b5dfe3267cbf26d883fb5c14813ce926f1 as java-builder
+FROM python:3.10.12-slim-bullseye@sha256:9dd3db79dd617291e7ee2dedb9724ab0e20e7953262cdaf1f9d67f0f02e39f7f as java-builder
 ARG TARGETARCH
 
 # install OpenJDK 11
@@ -37,7 +37,7 @@ jdk.localedata --include-locales en,th \
 
 
 # base: Stage which installs necessary runtime dependencies (OS packages, java,...)
-FROM python:3.10.11-slim-bullseye@sha256:fd86924ba14682eb11a3c244f60a35b5dfe3267cbf26d883fb5c14813ce926f1 as base
+FROM python:3.10.12-slim-bullseye@sha256:9dd3db79dd617291e7ee2dedb9724ab0e20e7953262cdaf1f9d67f0f02e39f7f as base
 ARG TARGETARCH
 
 # Install runtime OS package dependencies
@@ -159,6 +159,7 @@ RUN --mount=type=cache,target=/root/.cache \
     --mount=type=cache,target=/var/lib/localstack/cache \
     source .venv/bin/activate && \
     python -m localstack.cli.lpm install \
+      lambda-runtime \
       dynamodb-local && \
     chown -R localstack:localstack /usr/lib/localstack && \
     chmod -R 777 /usr/lib/localstack

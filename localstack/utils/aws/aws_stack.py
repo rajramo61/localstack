@@ -5,6 +5,7 @@ import os
 import re
 import socket
 import threading
+import warnings
 from functools import lru_cache
 from typing import Dict, Optional, Union
 
@@ -20,6 +21,7 @@ from localstack.constants import (
     APPLICATION_X_WWW_FORM_URLENCODED,
     ENV_DEV,
     HEADER_LOCALSTACK_ACCOUNT_ID,
+    INTERNAL_AWS_ACCESS_KEY_ID,
     LOCALHOST,
     MAX_POOL_CONNECTIONS,
     REGION_LOCAL,
@@ -193,10 +195,18 @@ def get_boto3_region() -> str:
     return boto3.session.Session().region_name
 
 
-def is_internal_call_context(headers):
+# TODO: remove this and use the `is_internal_call` property of RequestContext
+def is_internal_call_context(headers) -> bool:
     """Return whether we are executing in the context of an internal API call, i.e.,
     the case where one API uses a boto3 client to call another API internally."""
-    return HEADER_LOCALSTACK_ACCOUNT_ID in headers.keys()
+    if HEADER_LOCALSTACK_ACCOUNT_ID in headers.keys():
+        # TODO: Used by the old client, marked for removal
+        return True
+
+    if INTERNAL_AWS_ACCESS_KEY_ID in headers.get("Authorization", ""):
+        return True
+
+    return False
 
 
 def get_local_service_url(service_name_or_port: Union[str, int]) -> str:
@@ -217,6 +227,10 @@ def connect_to_resource(
     """
     Generic method to obtain an AWS service resource using boto3, based on environment, region, or custom endpoint_url.
     """
+    warnings.warn(
+        "`connect_to_resource` is obsolete. Use `localstack.aws.connect`", DeprecationWarning
+    )
+
     return connect_to_service(
         service_name,
         client=False,
@@ -239,6 +253,11 @@ def connect_to_resource_external(
     """
     Generic method to obtain an AWS service resource using boto3, based on environment, region, or custom endpoint_url.
     """
+    warnings.warn(
+        "`connect_to_resource_external` is obsolete. Use `localstack.aws.connect`",
+        DeprecationWarning,
+    )
+
     return create_external_boto_client(
         service_name,
         client=False,
@@ -265,6 +284,11 @@ def connect_to_service(
     """
     Generic method to obtain an AWS service client using boto3, based on environment, region, or custom endpoint_url.
     """
+    warnings.warn(
+        "`connect_to_service` is obsolete. Use `localstack.aws.connect`",
+        DeprecationWarning,
+    )
+
     # determine context and create cache key
     region_name = region_name or get_region()
     env = get_environment(env, region_name=region_name)
@@ -350,6 +374,11 @@ def create_external_boto_client(
     *args,
     **kwargs,
 ):
+    warnings.warn(
+        "`create_external_boto_client` is obsolete. Use `localstack.aws.connect`",
+        DeprecationWarning,
+    )
+
     # Currently we use the Access Key ID field to specify the AWS account ID; this will change when IAM matures.
     # It is important that the correct Account ID is included in the request as that will determine access to namespaced resources.
     if aws_access_key_id is None:

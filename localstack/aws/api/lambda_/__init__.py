@@ -235,6 +235,7 @@ class Runtime(str):
     python3_10 = "python3.10"
     java17 = "java17"
     ruby3_2 = "ruby3.2"
+    python3_11 = "python3.11"
 
 
 class SnapStartApplyOn(str):
@@ -487,6 +488,13 @@ class ProvisionedConcurrencyConfigNotFoundException(ServiceException):
     code: str = "ProvisionedConcurrencyConfigNotFoundException"
     sender_fault: bool = False
     status_code: int = 404
+    Type: Optional[String]
+
+
+class RecursiveInvocationException(ServiceException):
+    code: str = "RecursiveInvocationException"
+    sender_fault: bool = False
+    status_code: int = 400
     Type: Optional[String]
 
 

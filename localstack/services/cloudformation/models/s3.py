@@ -2,7 +2,8 @@ import re
 
 from botocore.exceptions import ClientError
 
-from localstack.config import get_edge_port_http
+from localstack.aws.connect import connect_to
+from localstack.config import LEGACY_S3_PROVIDER, get_edge_port_http
 from localstack.constants import S3_STATIC_WEBSITE_HOSTNAME, S3_VIRTUAL_HOSTNAME
 from localstack.services.cloudformation.cfn_utils import rename_params
 from localstack.services.cloudformation.deployment_utils import (
@@ -10,7 +11,10 @@ from localstack.services.cloudformation.deployment_utils import (
     generate_default_name,
 )
 from localstack.services.cloudformation.service_models import GenericBaseModel
-from localstack.services.s3 import s3_listener, s3_utils
+from localstack.services.s3.legacy.s3_listener import (
+    remove_bucket_notification as legacy_remove_bucket_notification,
+)
+from localstack.services.s3.utils import normalize_bucket_name
 from localstack.utils.aws import arns, aws_stack
 from localstack.utils.common import canonical_json, md5
 from localstack.utils.testutil import delete_all_s3_objects
@@ -23,14 +27,11 @@ class S3BucketPolicy(GenericBaseModel):
 
     def fetch_state(self, stack_name, resources):
         bucket_name = self.props.get("Bucket") or self.logical_resource_id
-        return aws_stack.connect_to_service("s3").get_bucket_policy(Bucket=bucket_name)
+        return connect_to().s3.get_bucket_policy(Bucket=bucket_name)
 
     @staticmethod
     def get_deploy_templates():
-        def _set_physical_resource_id(
-            result: dict, resource_id: str, resources: dict, resource_type: str
-        ):
-            resource = resources[resource_id]
+        def _handle_result(result: dict, logical_resource_id: str, resource: dict):
             resource["PhysicalResourceId"] = md5(
                 canonical_json(resource["Properties"]["PolicyDocument"])
             )
@@ -42,7 +43,7 @@ class S3BucketPolicy(GenericBaseModel):
                     dump_json_params(None, "PolicyDocument"),
                     {"PolicyDocument": "Policy", "Bucket": "Bucket"},
                 ),
-                "result_handler": _set_physical_resource_id,
+                "result_handler": _handle_result,
             },
             "delete": {"function": "delete_bucket_policy", "parameters": {"Bucket": "Bucket"}},
         }
@@ -55,13 +56,13 @@ class S3Bucket(GenericBaseModel):
 
     @staticmethod
     def normalize_bucket_name(bucket_name):
-        return s3_utils.normalize_bucket_name(bucket_name)
+        return normalize_bucket_name(bucket_name)
 
     @staticmethod
     def add_defaults(resource, stack_name: str):
         role_name = resource.get("Properties", {}).get("BucketName")
         if not role_name:
-            resource["Properties"]["BucketName"] = s3_listener.normalize_bucket_name(
+            resource["Properties"]["BucketName"] = normalize_bucket_name(
                 generate_default_name(stack_name, resource["LogicalResourceId"])
             )
 
@@ -123,8 +124,10 @@ class S3Bucket(GenericBaseModel):
 
             return {"CORSRules": cors_rules}
 
-        def s3_bucket_notification_config(params, **kwargs):
-            notif_config = params.get("NotificationConfiguration")
+        def s3_bucket_notification_config(
+            properties: dict, logical_resource_id: str, resource: dict, stack_name: str
+        ) -> dict | None:
+            notif_config = properties.get("NotificationConfiguration")
             if not notif_config:
                 return None
 
@@ -157,7 +160,7 @@ class S3Bucket(GenericBaseModel):
 
             # construct final result
             result = {
-                "Bucket": params.get("BucketName"),
+                "Bucket": properties.get("BucketName"),
                 "NotificationConfiguration": {
                     "LambdaFunctionConfigurations": lambda_configs,
                     "QueueConfigurations": queue_configs,
@@ -166,30 +169,41 @@ class S3Bucket(GenericBaseModel):
             }
             return result
 
-        def _set_physical_resource_id(
-            result: dict, resource_id: str, resources: dict, resource_type: str
-        ):
-            resource = resources[resource_id]
-            resource["PhysicalResourceId"] = resource["Properties"]["BucketName"]
+        def _handle_result(result: dict, logical_resource_id: str, resource: dict):
+            bucket_name = resource["Properties"]["BucketName"]
+            resource["PhysicalResourceId"] = bucket_name
+            resource["Properties"]["Arn"] = arns.s3_bucket_arn(bucket_name)
+            domain_name = f"{bucket_name}.{S3_VIRTUAL_HOSTNAME}"
+            resource["Properties"]["DomainName"] = domain_name
+            resource["Properties"]["RegionalDomainName"] = domain_name
+            # by default (parity) s3 website only supports http
+            #   https://docs.aws.amazon.com/AmazonS3/latest/userguide/WebsiteHosting.html
+            #   "Amazon S3 website endpoints do not support HTTPS. If you want to use HTTPS,
+            #   you can use Amazon CloudFront [...]"
+            resource["Properties"][
+                "WebsiteURL"
+            ] = f"http://{bucket_name}.{S3_STATIC_WEBSITE_HOSTNAME}:{get_edge_port_http()}"
+            # resource["Properties"]["DualStackDomainName"] = ?
 
         def _pre_delete(logical_resource_id: str, resource: dict, stack_name: str):
-            s3 = aws_stack.connect_to_service("s3")
+            s3 = connect_to().s3
             props = resource["Properties"]
             bucket_name = props.get("BucketName")
             try:
                 s3.delete_bucket_policy(Bucket=bucket_name)
             except Exception:
                 pass
-            s3_listener.remove_bucket_notification(resource["PhysicalResourceId"])
+            if LEGACY_S3_PROVIDER:
+                legacy_remove_bucket_notification(resource["PhysicalResourceId"])
             # TODO: divergence from how AWS deals with bucket deletes (should throw an error)
             try:
-                delete_all_s3_objects(bucket_name)
+                delete_all_s3_objects(s3, bucket_name)
             except Exception as e:
                 if "NoSuchBucket" not in str(e):
                     raise
 
         def _add_bucket_tags(logical_resource_id: str, resource: dict, stack_name: str):
-            s3 = aws_stack.connect_to_service("s3")
+            s3 = connect_to().s3
             props = resource["Properties"]
             bucket_name = props.get("BucketName")
             tags = props.get("Tags", [])
@@ -197,7 +211,7 @@ class S3Bucket(GenericBaseModel):
                 s3.put_bucket_tagging(Bucket=bucket_name, Tagging={"TagSet": tags})
 
         def _put_bucket_versioning(logical_resource_id: str, resource: dict, stack_name: str):
-            s3_client = aws_stack.connect_to_service("s3")
+            s3_client = connect_to().s3
             props = resource["Properties"]
             bucket_name = props.get("BucketName")
             versioning_config = props.get("VersioningConfiguration")
@@ -212,7 +226,7 @@ class S3Bucket(GenericBaseModel):
         def _put_bucket_cors_configuration(
             logical_resource_id: str, resource: dict, stack_name: str
         ):
-            s3_client = aws_stack.connect_to_service("s3")
+            s3_client = connect_to().s3
             props = resource["Properties"]
             bucket_name = props.get("BucketName")
             cors_configuration = transform_cfn_cors(props.get("CorsConfiguration"))
@@ -225,7 +239,7 @@ class S3Bucket(GenericBaseModel):
         def _put_bucket_website_configuration(
             logical_resource_id: str, resource: dict, stack_name: str
         ):
-            s3_client = aws_stack.connect_to_service("s3")
+            s3_client = connect_to().s3
             props = resource["Properties"]
             bucket_name = props.get("BucketName")
             website_config = transform_website_configuration(props.get("WebsiteConfiguration"))
@@ -236,7 +250,7 @@ class S3Bucket(GenericBaseModel):
                 )
 
         def _create_bucket(logical_resource_id: str, resource: dict, stack_name: str):
-            s3_client = aws_stack.connect_to_service("s3")
+            s3_client = connect_to().s3
             props = resource["Properties"]
             bucket_name = props.get("BucketName")
             try:
@@ -258,7 +272,7 @@ class S3Bucket(GenericBaseModel):
             "create": [
                 {
                     "function": _create_bucket,
-                    "result_handler": _set_physical_resource_id,
+                    "result_handler": _handle_result,
                 },
                 {
                     "function": "put_bucket_notification_configuration",
@@ -278,9 +292,9 @@ class S3Bucket(GenericBaseModel):
 
     def fetch_state(self, stack_name, resources):
         props = self.props
-        bucket_name = self._get_bucket_name()
+        bucket_name = props["BucketName"]
         bucket_name = self.normalize_bucket_name(bucket_name)
-        s3_client = aws_stack.connect_to_service("s3")
+        s3_client = connect_to().s3
         response = s3_client.get_bucket_location(Bucket=bucket_name)
         notifs = props.get("NotificationConfiguration")
         if not response or not notifs:
@@ -300,23 +314,3 @@ class S3Bucket(GenericBaseModel):
             return None
 
         return response
-
-    def get_cfn_attribute(self, attribute_name):
-        if attribute_name in ["Arn"]:
-            return arns.s3_bucket_arn(self._get_bucket_name())
-        if attribute_name in ["DomainName", "RegionalDomainName"]:
-            bucket_name = self._get_bucket_name()
-            return "%s.%s" % (bucket_name, S3_VIRTUAL_HOSTNAME)
-
-        if attribute_name == "WebsiteURL":
-            bucket_name = self.props.get("BucketName")
-            # by default (parity) s3 website only supports http
-            #   https://docs.aws.amazon.com/AmazonS3/latest/userguide/WebsiteHosting.html
-            #   "Amazon S3 website endpoints do not support HTTPS. If you want to use HTTPS,
-            #   you can use Amazon CloudFront [...]"
-            return f"http://{bucket_name}.{S3_STATIC_WEBSITE_HOSTNAME}:{get_edge_port_http()}"
-
-        return super(S3Bucket, self).get_cfn_attribute(attribute_name)
-
-    def _get_bucket_name(self):
-        return self.props.get("BucketName") or self.logical_resource_id

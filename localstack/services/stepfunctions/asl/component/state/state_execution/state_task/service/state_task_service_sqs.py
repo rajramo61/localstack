@@ -1,5 +1,6 @@
 from typing import Final, Optional
 
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from localstack.aws.api.stepfunctions import HistoryEventType, TaskFailedEventDetails
@@ -34,6 +35,9 @@ class StateTaskServiceSqs(StateTaskServiceCallback):
         }
     }
 
+    def _get_supported_parameters(self) -> Optional[set[str]]:
+        return self._SUPPORTED_API_PARAM_BINDINGS.get(self.resource.api_action.lower())
+
     def _from_error(self, env: Environment, ex: Exception) -> FailureEvent:
         if isinstance(ex, ClientError):
             return FailureEvent(
@@ -50,37 +54,7 @@ class StateTaskServiceSqs(StateTaskServiceCallback):
                     )
                 ),
             )
-        else:
-            return FailureEvent(
-                error_name=CustomErrorName(self._ERROR_NAME_AWS),
-                event_type=HistoryEventType.TaskFailed,
-                event_details=EventDetails(
-                    taskFailedEventDetails=TaskFailedEventDetails(
-                        error=self._ERROR_NAME_AWS,
-                        cause=str(ex),  # TODO: update to report expected cause.
-                        resource=self._get_sfn_resource(),
-                        resourceType=self._get_sfn_resource_type(),
-                    )
-                ),
-            )
-
-    def _eval_parameters(self, env: Environment) -> dict:
-        api_action: str = self.resource.api_action
-        supported_parameters: Optional[set[str]] = self._SUPPORTED_API_PARAM_BINDINGS.get(
-            api_action.lower(), None
-        )
-        if supported_parameters is None:
-            raise RuntimeError("TODO: raise unsupported api error?")
-
-        parameters: dict = super()._eval_parameters(env=env)
-        unsupported_parameters: list[str] = [
-            parameter for parameter in parameters.keys() if parameter not in supported_parameters
-        ]
-        if unsupported_parameters:
-            for unsupported_parameter in unsupported_parameters:
-                parameters.pop(unsupported_parameter, None)
-
-        return parameters
+        return super()._from_error(env=env, ex=ex)
 
     def _eval_service_task(self, env: Environment, parameters: dict) -> None:
         # TODO: Stepfunctions automatically dumps to json MessageBody's definitions.
@@ -91,7 +65,7 @@ class StateTaskServiceSqs(StateTaskServiceCallback):
                 parameters["MessageBody"] = to_json_str(message_body)
 
         api_action = camel_to_snake_case(self.resource.api_action)
-        sqs_client = aws_stack.create_external_boto_client("sqs")
+        sqs_client = aws_stack.connect_to_service("sqs", config=Config(parameter_validation=False))
         response = getattr(sqs_client, api_action)(**parameters)
         response.pop("ResponseMetadata", None)
         env.stack.append(response)

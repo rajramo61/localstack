@@ -1,9 +1,11 @@
 import contextlib
 import copy
+import hashlib
 import json
 import logging
 import re
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict, Union
 from urllib import parse as urlparse
@@ -18,13 +20,17 @@ from requests.models import Response
 
 from localstack import config
 from localstack.aws.accounts import get_aws_account_id
+from localstack.aws.api import RequestContext
 from localstack.aws.api.apigateway import (
     Authorizer,
     ConnectionType,
+    DocumentationPart,
+    DocumentationPartLocation,
     IntegrationType,
     Model,
     RequestValidator,
 )
+from localstack.aws.connect import connect_to
 from localstack.constants import (
     APPLICATION_JSON,
     HEADER_LOCALSTACK_EDGE_URL,
@@ -43,7 +49,7 @@ from localstack.utils.aws import resources as resource_utils
 from localstack.utils.aws.arns import parse_arn
 from localstack.utils.aws.aws_responses import requests_error_response_json, requests_response
 from localstack.utils.aws.request_context import MARKER_APIGW_REQUEST_REGION, THREAD_LOCAL
-from localstack.utils.strings import long_uid, short_uid
+from localstack.utils.strings import long_uid, short_uid, to_bytes, to_str
 from localstack.utils.time import TIMESTAMP_FORMAT_TZ, timestamp
 from localstack.utils.urls import localstack_host
 
@@ -71,7 +77,18 @@ PATH_REGEX_PATH_MAPPINGS = r"/domainnames/([^/]+)/basepathmappings/?(.*)"
 PATH_REGEX_CLIENT_CERTS = r"/clientcertificates/?([^/]+)?$"
 PATH_REGEX_VPC_LINKS = r"/vpclinks/([^/]+)?(.*)"
 PATH_REGEX_TEST_INVOKE_API = r"^\/restapis\/([A-Za-z0-9_\-]+)\/resources\/([A-Za-z0-9_\-]+)\/methods\/([A-Za-z0-9_\-]+)/?(\?.*)?"
-
+INVOKE_TEST_LOG_TEMPLATE = """Execution log for request {request_id}
+        {formatted_date} : Starting execution for request: {request_id}
+        {formatted_date} : HTTP Method: {http_method}, Resource Path: {resource_path}
+        {formatted_date} : Method request path: {request_path}
+        {formatted_date} : Method request query string: {query_string}
+        {formatted_date} : Method request headers: {request_headers}
+        {formatted_date} : Method request body before transformations: {request_body}
+        {formatted_date} : Method response body after transformations: {response_body}
+        {formatted_date} : Method response headers: {response_headers}
+        {formatted_date} : Successfully completed execution
+        {formatted_date} : Method completed with status: {status_code}
+        """
 # template for SQS inbound data
 APIGATEWAY_SQS_DATA_INBOUND_TEMPLATE = (
     "Action=SendMessage&MessageBody=$util.base64Encode($input.json('$'))"
@@ -114,8 +131,33 @@ class OpenAPIExt:
 # TODO: make the CRUD operations in this file generic for the different model types (authorizes, validators, ...)
 
 
-def get_apigateway_store(account_id: str = None, region: str = None) -> ApiGatewayStore:
-    return apigateway_stores[account_id or get_aws_account_id()][region or aws_stack.get_region()]
+def get_apigateway_store(context: RequestContext) -> ApiGatewayStore:
+    return apigateway_stores[context.account_id][context.region]
+
+
+def get_apigateway_store_for_invocation(context: ApiInvocationContext) -> ApiGatewayStore:
+    account_id = context.account_id or get_aws_account_id()
+    region_name = context.region_name or aws_stack.get_region()
+    return apigateway_stores[account_id][region_name]
+
+
+class ApiGatewayIntegrationError(Exception):
+    """
+    Base class for all ApiGateway Integration errors.
+    Can be used as is or extended for common error types.
+    These exceptions should be handled in one place, and bubble up from all others.
+    """
+
+    message: str
+    status_code: int
+
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+    def to_response(self):
+        return requests_response({"message": self.message}, status_code=self.status_code)
 
 
 class OpenAPISpecificationResolver:
@@ -437,6 +479,40 @@ def make_error_response(message, code=400, error_type=None):
     return requests_error_response_json(message, code=code, error_type=error_type)
 
 
+def select_integration_response(matched_part: str, invocation_context: ApiInvocationContext):
+    int_responses = invocation_context.integration.get("integrationResponses") or {}
+    select_by_pattern = [
+        response
+        for response in int_responses.values()
+        if response.get("selectionPattern")
+        and re.match(response.get("selectionPattern"), matched_part)
+    ]
+    if select_by_pattern:
+        selected_response = select_by_pattern[0]
+        if len(select_by_pattern) > 1:
+            LOG.warning(
+                "Multiple integration responses matching '%s' statuscode. Choosing '%s' (first).",
+                matched_part,
+                selected_response["statusCode"],
+            )
+        return selected_response
+    else:
+        # choose default return code
+        default_responses = [
+            response for response in int_responses.values() if not response.get("selectionPattern")
+        ]
+        if not default_responses:
+            raise ApiGatewayIntegrationError("Internal server error", 500)
+
+        selected_response = default_responses[0]
+        if len(default_responses) > 1:
+            LOG.warning(
+                "Multiple default integration responses. Choosing %s (first).",
+                selected_response["statusCode"],
+            )
+        return selected_response
+
+
 def make_accepted_response():
     response = Response()
     response.status_code = 202
@@ -461,7 +537,7 @@ def get_stage_variables(context: ApiInvocationContext) -> Optional[Dict[str, str
         return {}
 
     _, region_name = get_api_account_id_and_region(context.api_id)
-    api_gateway_client = aws_stack.connect_to_service("apigateway", region_name=region_name)
+    api_gateway_client = connect_to(region_name=region_name).apigateway
     try:
         response = api_gateway_client.get_stage(restApiId=context.api_id, stageName=context.stage)
         return response.get("variables")
@@ -550,7 +626,7 @@ def get_cors_response(headers):
 
 
 def get_rest_api_paths(rest_api_id, region_name=None):
-    apigateway = aws_stack.connect_to_service(service_name="apigateway", region_name=region_name)
+    apigateway = connect_to(region_name=region_name).apigateway
     resources = apigateway.get_resources(restApiId=rest_api_id, limit=100)
     resource_map = {}
     for resource in resources["items"]:
@@ -713,11 +789,31 @@ def apply_json_patch_safe(subject, patch_operations, in_place=True, return_list=
     return (results or [subject])[-1]
 
 
+def add_documentation_parts(rest_api_container, documentation):
+    for doc_part in documentation.get("documentationParts", []):
+        entity_id = short_uid()[:6]
+        location = doc_part["location"]
+        rest_api_container.documentation_parts[entity_id] = DocumentationPart(
+            id=entity_id,
+            location=DocumentationPartLocation(
+                type=location.get("type"),
+                path=location.get("path", "/")
+                if location.get("type") not in ["API", "MODEL"]
+                else None,
+                method=location.get("method"),
+                statusCode=location.get("statusCode"),
+                name=location.get("name"),
+            ),
+            properties=doc_part["properties"],
+        )
+
+
 def import_api_from_openapi_spec(
-    rest_api: RestAPI, body: Dict, query_params: Dict, account_id: str = None, region: str = None
+    rest_api: RestAPI, body: dict, context: RequestContext
 ) -> Optional[RestAPI]:
     """Import an API from an OpenAPI spec document"""
 
+    query_params: dict = context.request.values.to_dict()
     resolved_schema = resolve_references(copy.deepcopy(body), rest_api_id=rest_api.id)
 
     # TODO:
@@ -736,7 +832,7 @@ def import_api_from_openapi_spec(
     # authorizers map to avoid duplication
     authorizers = {}
 
-    store = get_apigateway_store(account_id=account_id, region=region)
+    store = get_apigateway_store(context=context)
     rest_api_container = store.rest_apis[rest_api.id]
 
     def is_api_key_required(path_payload: dict) -> bool:
@@ -761,61 +857,57 @@ def import_api_from_openapi_spec(
                         return True
         return False
 
-    def create_authorizer(path_payload: dict) -> Optional[Authorizer]:
+    def create_authorizers(security_schemes: dict) -> None:
+
+        for security_scheme_name, security_config in security_schemes.items():
+            aws_apigateway_authorizer = security_config.get(OpenAPIExt.AUTHORIZER, {})
+            if not aws_apigateway_authorizer:
+                continue
+
+            if security_scheme_name in authorizers:
+                continue
+
+            authorizer_type = aws_apigateway_authorizer.get("type", "").upper()
+            # TODO: do we need validation of resources here?
+            authorizer = Authorizer(
+                id=create_resource_id(),
+                name=security_scheme_name,
+                type=authorizer_type,
+                authorizerResultTtlInSeconds=aws_apigateway_authorizer.get(
+                    "authorizerResultTtlInSeconds", 300
+                ),
+            )
+            if provider_arns := aws_apigateway_authorizer.get("providerARNs"):
+                authorizer["providerARNs"] = provider_arns
+            if auth_type := security_config.get(OpenAPIExt.AUTHTYPE):
+                authorizer["authType"] = auth_type
+            if authorizer_uri := aws_apigateway_authorizer.get("authorizerUri"):
+                authorizer["authorizerUri"] = authorizer_uri
+            if authorizer_credentials := aws_apigateway_authorizer.get("authorizerCredentials"):
+                authorizer["authorizerCredentials"] = authorizer_credentials
+            if authorizer_type == "TOKEN":
+                header_name = security_config.get("name")
+                authorizer["identitySource"] = f"method.request.header.{header_name}"
+            elif identity_source := aws_apigateway_authorizer.get("identitySource"):
+                # https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-swagger-extensions-authorizer.html
+                # Applicable for the authorizer of the request and jwt type only
+                authorizer["identitySource"] = identity_source
+            if identity_validation_expression := aws_apigateway_authorizer.get(
+                "identityValidationExpression"
+            ):
+                authorizer["identityValidationExpression"] = identity_validation_expression
+
+            rest_api_container.authorizers[authorizer["id"]] = authorizer
+
+            authorizers[security_scheme_name] = authorizer
+
+    def get_authorizer(path_payload: dict) -> Optional[Authorizer]:
         if not (security_schemes := path_payload.get("security")):
             return None
 
         for security_scheme in security_schemes:
             for security_scheme_name in security_scheme.keys():
-                # $.securityDefinitions is Swagger 2.0
-                # $.components.SecuritySchemes is OpenAPI 3.0
-                security_definitions = resolved_schema.get(
-                    "securityDefinitions"
-                ) or resolved_schema.get("components", {}).get("securitySchemes", {})
-                if security_scheme_name in security_definitions:
-                    security_config = security_definitions.get(security_scheme_name)
-                    aws_apigateway_authorizer = security_config.get(OpenAPIExt.AUTHORIZER, {})
-                    if not aws_apigateway_authorizer:
-                        continue
-
-                    if authorizer := authorizers.get(security_scheme_name):
-                        return authorizer
-
-                    authorizer_type = aws_apigateway_authorizer.get("type", "").upper()
-                    # TODO: do we need validation of resources here?
-                    authorizer = Authorizer(
-                        id=create_resource_id(),
-                        name=security_scheme_name,
-                        type=authorizer_type,
-                        authorizerResultTtlInSeconds=aws_apigateway_authorizer.get(
-                            "authorizerResultTtlInSeconds", 300
-                        ),
-                    )
-                    if provider_arns := aws_apigateway_authorizer.get("providerARNs"):
-                        authorizer["providerARNs"] = provider_arns
-                    if auth_type := security_config.get(OpenAPIExt.AUTHTYPE):
-                        authorizer["authType"] = auth_type
-                    if authorizer_uri := aws_apigateway_authorizer.get("authorizerUri"):
-                        authorizer["authorizerUri"] = authorizer_uri
-                    if authorizer_credentials := aws_apigateway_authorizer.get(
-                        "authorizerCredentials"
-                    ):
-                        authorizer["authorizerCredentials"] = authorizer_credentials
-                    if authorizer_type == "TOKEN":
-                        header_name = security_config.get("name")
-                        authorizer["identitySource"] = f"method.request.header.{header_name}"
-                    elif identity_source := aws_apigateway_authorizer.get("identitySource"):
-                        # https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-swagger-extensions-authorizer.html
-                        # Applicable for the authorizer of the request and jwt type only
-                        authorizer["identitySource"] = identity_source
-                    if identity_validation_expression := aws_apigateway_authorizer.get(
-                        "identityValidationExpression"
-                    ):
-                        authorizer["identityValidationExpression"] = identity_validation_expression
-
-                    rest_api_container.authorizers[authorizer["id"]] = authorizer
-
-                    authorizers[security_scheme_name] = authorizer
+                if authorizer := authorizers.get(security_scheme_name):
                     return authorizer
 
     def get_or_create_path(abs_path: str, base_path: str):
@@ -1056,7 +1148,7 @@ def import_api_from_openapi_spec(
         api_key_required = is_api_key_required(method_schema)
         kwargs = {}
 
-        if authorizer := create_authorizer(method_schema) or default_authorizer:
+        if authorizer := get_authorizer(method_schema) or default_authorizer:
             method_authorizer = authorizer or default_authorizer
             # override the authorizer_type if it's a TOKEN or REQUEST to CUSTOM
             if (authorizer_type := method_authorizer["type"]) in ("TOKEN", "REQUEST"):
@@ -1107,8 +1199,17 @@ def import_api_from_openapi_spec(
     # get default requestValidator if present
     default_req_validator_name = resolved_schema.get(OpenAPIExt.REQUEST_VALIDATOR)
 
+    # $.securityDefinitions is Swagger 2.0
+    # $.components.SecuritySchemes is OpenAPI 3.0
+    security_data = resolved_schema.get("securityDefinitions") or resolved_schema.get(
+        "components", {}
+    ).get("securitySchemes", {})
+    # create the defined authorizers, even if they're not used by any routes
+    if security_data:
+        create_authorizers(security_data)
+
     # create default authorizer if present
-    default_authorizer = create_authorizer(resolved_schema)
+    default_authorizer = get_authorizer(resolved_schema)
 
     # determine base path
     # default basepath mode is "ignore"
@@ -1162,6 +1263,9 @@ def import_api_from_openapi_spec(
     if api_key_source is not None:
         rest_api.api_key_source = api_key_source.upper()
 
+    documentation = resolved_schema.get(OpenAPIExt.DOCUMENTATION)
+    if documentation:
+        add_documentation_parts(rest_api_container, documentation)
     return rest_api
 
 
@@ -1279,18 +1383,9 @@ def set_api_id_stage_invocation_path(
         stage = path.strip("/").split("/")[0]
         relative_path_w_query_params = "/%s" % path.lstrip("/").partition("/")[2]
     elif test_invoke_match:
-        # special case: fetch the resource details for TestInvokeApi invocations
-        stage = None
-        region_name = invocation_context.region_name
-        api_id = test_invoke_match.group(1)
-        resource_id = test_invoke_match.group(2)
-        query_string = test_invoke_match.group(4) or ""
-        apigateway = aws_stack.connect_to_service(
-            service_name="apigateway", region_name=region_name
-        )
-        resource = apigateway.get_resource(restApiId=api_id, resourceId=resource_id)
-        resource_path = resource.get("path")
-        relative_path_w_query_params = f"{resource_path}{query_string}"
+        stage = invocation_context.stage
+        api_id = invocation_context.api_id
+        relative_path_w_query_params = invocation_context.path_with_query_string
     else:
         raise Exception(
             f"Unable to extract API Gateway details from request: {path} {dict(headers)}"
@@ -1382,7 +1477,7 @@ class OpenApiExporter:
         """
         https://github.com/OAI/OpenAPI-Specification/blob/main/versions/2.0.md
         """
-        apigateway_client = aws_stack.connect_to_service("apigateway")
+        apigateway_client = connect_to().apigateway
 
         rest_api = apigateway_client.get_rest_api(restApiId=api_id)
         resources = apigateway_client.get_resources(restApiId=api_id)
@@ -1403,7 +1498,7 @@ class OpenApiExporter:
         """
         https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.1.0.md
         """
-        apigateway_client = aws_stack.connect_to_service("apigateway")
+        apigateway_client = connect_to().apigateway
 
         rest_api = apigateway_client.get_rest_api(restApiId=api_id)
         resources = apigateway_client.get_resources(restApiId=api_id)
@@ -1426,3 +1521,63 @@ def is_greedy_path(path_part: str) -> bool:
 
 def is_variable_path(path_part: str) -> bool:
     return path_part.startswith("{") and path_part.endswith("}")
+
+
+def multi_value_dict_for_list(elements: Union[List, Dict]) -> Dict:
+    temp_mv_dict = defaultdict(list)
+    for key in elements:
+        if isinstance(key, (list, tuple)):
+            key, value = key
+        else:
+            value = elements[key]
+
+        key = to_str(key)
+        temp_mv_dict[key].append(value)
+    return {k: tuple(v) for k, v in temp_mv_dict.items()}
+
+
+def log_template(
+    request_id: str,
+    date: datetime,
+    http_method: str,
+    resource_path: str,
+    request_path: str,
+    query_string: str,
+    request_headers: str,
+    request_body: str,
+    response_body: str,
+    response_headers: str,
+    status_code: str,
+):
+    formatted_date = date.strftime("%a %b %d %H:%M:%S %Z %Y")
+    return INVOKE_TEST_LOG_TEMPLATE.format(
+        request_id=request_id,
+        formatted_date=formatted_date,
+        http_method=http_method,
+        resource_path=resource_path,
+        request_path=request_path,
+        query_string=query_string,
+        request_headers=request_headers,
+        request_body=request_body,
+        response_body=response_body,
+        response_headers=response_headers,
+        status_code=status_code,
+    )
+
+
+def get_domain_name_hash(domain_name: str) -> str:
+    """
+    Return a hash of the given domain name, which help construct regional domain names for APIs.
+    TODO: use this in the future to dispatch API Gateway API invocations made to the regional domain name
+    """
+    return hashlib.shake_128(to_bytes(domain_name)).hexdigest(4)
+
+
+def get_regional_domain_name(domain_name: str) -> str:
+    """
+    Return the regional domain name for the given domain name.
+    In real AWS, this would look something like: "d-oplm2qchq0.execute-api.us-east-1.amazonaws.com"
+    In LocalStack, we're returning this format: "d-<domain_hash>.execute-api.localhost.localstack.cloud"
+    """
+    domain_name_hash = get_domain_name_hash(domain_name)
+    return f"d-{domain_name_hash}.execute-api.{LOCALHOST_HOSTNAME}"

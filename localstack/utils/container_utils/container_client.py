@@ -18,10 +18,10 @@ from localstack.utils.no_exit_argument_parser import NoExitArgumentParser
 if sys.version_info >= (3, 8):
     from typing import Literal, Protocol, get_args
 else:
-    from typing_extensions import Protocol, get_args, Literal
+    from typing_extensions import Literal, Protocol, get_args
 
 from localstack import config
-from localstack.utils.collections import HashableList
+from localstack.utils.collections import HashableList, ensure_list
 from localstack.utils.files import TMP_FILES, rm_rf, save_file
 from localstack.utils.strings import short_uid
 
@@ -408,16 +408,17 @@ class ContainerConfiguration:
     name: Optional[str] = None
     volumes: Optional[VolumeMappings] = None
     ports: Optional[PortMappings] = None
+    exposed_ports: Optional[List[str]] = None
     entrypoint: Optional[str] = None
-    additional_flags: Optional[List[str]] = None
+    additional_flags: Optional[str] = None
     command: Optional[List[str]] = None
     env_vars: Dict[str, str] = dataclasses.field(default_factory=dict)
 
-    privileged: Optional[bool] = None
-    remove: Optional[bool] = None
-    interactive: Optional[bool] = None
-    tty: Optional[bool] = None
-    detach: Optional[bool] = None
+    privileged: bool = False
+    remove: bool = False
+    interactive: bool = False
+    tty: bool = False
+    detach: bool = False
 
     stdin: Optional[str] = None
     user: Optional[str] = None
@@ -448,12 +449,19 @@ class DockerRunFlags:
     ports: Optional[PortMappings]
     ulimits: Optional[List[Ulimit]]
     user: Optional[str]
+    dns: Optional[List[str]]
 
 
 # TODO: remove Docker/Podman compatibility switches (in particular strip_wellknown_repo_prefixes=...)
 #  from the container client base interface and introduce derived Podman client implementations instead!
 class ContainerClient(metaclass=ABCMeta):
-    STOP_TIMEOUT = 0
+    @abstractmethod
+    def get_system_info(self) -> dict:
+        """Returns the docker system-wide information as dictionary (``docker info``)."""
+
+    def get_system_id(self) -> str:
+        """Returns the unique and stable ID of the docker daemon."""
+        return self.get_system_info()["ID"]
 
     @abstractmethod
     def get_container_status(self, container_name: str) -> DockerContainerStatus:
@@ -484,6 +492,14 @@ class ContainerClient(metaclass=ABCMeta):
         network_attrs = self.inspect_network(container_network)
         containers = network_attrs.get("Containers") or {}
         if container_id not in containers:
+            LOG.debug("Network attributes: %s", network_attrs)
+            try:
+                inspection = self.inspect_container(container_name_or_id=container_name_or_id)
+                LOG.debug("Container %s Attributes: %s", container_name_or_id, inspection)
+                logs = self.get_container_logs(container_name_or_id=container_name_or_id)
+                LOG.debug("Container %s Logs: %s", container_name_or_id, logs)
+            except ContainerException as e:
+                LOG.debug("Cannot inspect container %s: %s", container_name_or_id, e)
             raise ContainerException(
                 "Container %s is not connected to target network %s",
                 container_name_or_id,
@@ -498,11 +514,10 @@ class ContainerClient(metaclass=ABCMeta):
         return ip
 
     @abstractmethod
-    def stop_container(self, container_name: str, timeout: int = None):
+    def stop_container(self, container_name: str, timeout: int = 10):
         """Stops container with given name
         :param container_name: Container identifier (name or id) of the container to be stopped
         :param timeout: Timeout after which SIGKILL is sent to the container.
-                        If not specified, defaults to `STOP_TIMEOUT`
         """
 
     @abstractmethod
@@ -761,6 +776,7 @@ class ContainerClient(metaclass=ABCMeta):
             command=container_config.command,
             mount_volumes=container_config.volumes,
             ports=container_config.ports,
+            exposed_ports=container_config.exposed_ports,
             env_vars=container_config.env_vars,
             user=container_config.user,
             cap_add=container_config.cap_add,
@@ -788,13 +804,14 @@ class ContainerClient(metaclass=ABCMeta):
         command: Optional[Union[List[str], str]] = None,
         mount_volumes: Optional[Union[VolumeMappings, List[SimpleVolumeBind]]] = None,
         ports: Optional[PortMappings] = None,
+        exposed_ports: Optional[List[str]] = None,
         env_vars: Optional[Dict[str, str]] = None,
         user: Optional[str] = None,
         cap_add: Optional[List[str]] = None,
         cap_drop: Optional[List[str]] = None,
         security_opt: Optional[List[str]] = None,
         network: Optional[str] = None,
-        dns: Optional[str] = None,
+        dns: Optional[Union[str, List[str]]] = None,
         additional_flags: Optional[str] = None,
         workdir: Optional[str] = None,
         privileged: Optional[bool] = None,
@@ -819,8 +836,9 @@ class ContainerClient(metaclass=ABCMeta):
         tty: bool = False,
         detach: bool = False,
         command: Optional[Union[List[str], str]] = None,
-        mount_volumes: Optional[List[SimpleVolumeBind]] = None,
+        mount_volumes: Optional[Union[VolumeMappings, List[SimpleVolumeBind]]] = None,
         ports: Optional[PortMappings] = None,
+        exposed_ports: Optional[List[str]] = None,
         env_vars: Optional[Dict[str, str]] = None,
         user: Optional[str] = None,
         cap_add: Optional[List[str]] = None,
@@ -838,6 +856,38 @@ class ContainerClient(metaclass=ABCMeta):
 
         :return: A tuple (stdout, stderr)
         """
+
+    def run_container_from_config(
+        self, container_config: ContainerConfiguration
+    ) -> Tuple[bytes, bytes]:
+        """Like ``run_container`` but uses the parameters from the configuration."""
+
+        return self.run_container(
+            image_name=container_config.image_name,
+            stdin=container_config.stdin,
+            name=container_config.name,
+            entrypoint=container_config.entrypoint,
+            remove=container_config.remove,
+            interactive=container_config.interactive,
+            tty=container_config.tty,
+            detach=container_config.detach,
+            command=container_config.command,
+            mount_volumes=container_config.volumes,
+            ports=container_config.ports,
+            exposed_ports=container_config.exposed_ports,
+            env_vars=container_config.env_vars,
+            user=container_config.user,
+            cap_add=container_config.cap_add,
+            cap_drop=container_config.cap_drop,
+            security_opt=container_config.security_opt,
+            network=container_config.network,
+            dns=container_config.dns,
+            additional_flags=container_config.additional_flags,
+            workdir=container_config.workdir,
+            platform=container_config.platform,
+            privileged=container_config.privileged,
+            ulimits=container_config.ulimits,
+        )
 
     @abstractmethod
     def exec_in_container(
@@ -993,6 +1043,7 @@ class Util:
         privileged: Optional[bool] = None,
         user: Optional[str] = None,
         ulimits: Optional[List[Ulimit]] = None,
+        dns: Optional[Union[str, List[str]]] = None,
     ) -> DockerRunFlags:
         """Parses additional CLI-formatted Docker flags, which could overwrite provided defaults.
         :param additional_flags: String which contains the flag definitions inspired by the Docker CLI reference:
@@ -1006,6 +1057,7 @@ class Util:
         :param privileged: Run the container in privileged mode. Warning will be printed if overwritten in flags.
         :param ulimits: ulimit options in the format <type>=<soft limit>[:<hard limit>]
         :param user: User to run first process. Warning will be printed if user is overwritten in flags.
+        :param dns: List of DNS servers to configure the container with.
         :return: A DockerRunFlags object that will return new objects if respective parameters were None and
                 additional flags contained a flag for that object or the same which are passed otherwise.
         """
@@ -1051,6 +1103,7 @@ class Util:
         parser.add_argument(
             "--volume", "-v", help="Bind mount a volume", dest="volumes", action="append"
         )
+        parser.add_argument("--dns", help="Set custom DNS servers", dest="dns", action="append")
 
         # Parse
         flags = shlex.split(additional_flags)
@@ -1065,9 +1118,9 @@ class Util:
                 extra_hosts[hosts_split[0]] = hosts_split[1]
 
         if args.envs:
+            env_vars = env_vars if env_vars is not None else {}
             for env in args.envs:
                 lhs, _, rhs = env.partition("=")
-                env_vars = env_vars if env_vars is not None else {}
                 env_vars[lhs] = rhs
 
         if args.labels:
@@ -1096,7 +1149,9 @@ class Util:
 
         if args.privileged:
             LOG.warning(
-                f"Overwriting Docker container privileged flag {privileged} with new value {args.privileged}"
+                "Overwriting Docker container privileged flag %s with new value %s",
+                privileged,
+                args.privileged,
             )
             privileged = args.privileged
 
@@ -1163,6 +1218,13 @@ class Util:
                     LOG.info("Volume options like :ro or :rw are currently ignored.")
                 mounts.append((host_path, container_path))
 
+        dns = ensure_list(dns or [])
+        if args.dns:
+            LOG.info(
+                "Extending Docker container DNS servers %s with additional values %s", dns, args.dns
+            )
+            dns.extend(args.dns)
+
         return DockerRunFlags(
             env_vars=env_vars,
             extra_hosts=extra_hosts,
@@ -1174,6 +1236,7 @@ class Util:
             privileged=privileged,
             ulimits=ulimits,
             user=user,
+            dns=dns,
         )
 
     @staticmethod

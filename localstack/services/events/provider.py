@@ -31,8 +31,10 @@ from localstack.aws.api.events import (
     RuleName,
     RuleState,
     ScheduleExpression,
+    String,
     TagList,
     TargetList,
+    TestEventPatternResponse,
 )
 from localstack.constants import APPLICATION_AMZ_JSON_1_1
 from localstack.services.events.models import EventsStore, events_stores
@@ -70,6 +72,21 @@ class EventsProvider(EventsApi, ServiceLifecycleHook):
     @staticmethod
     def get_store(context: RequestContext) -> EventsStore:
         return events_stores[context.account_id][context.region]
+
+    def test_event_pattern(
+        self, context: RequestContext, event_pattern: EventPattern, event: String
+    ) -> TestEventPatternResponse:
+
+        # https://docs.aws.amazon.com/eventbridge/latest/APIReference/API_TestEventPattern.html
+        # Test event pattern uses event pattern to match against event.
+        # So event pattern keys must be in the event keys and values must match.
+        # If event pattern has a key that event does not have, it is not a match.
+        evt_pattern = json.loads(str(event_pattern))
+        evt = json.loads(str(event))
+
+        if any(key not in evt or evt[key] not in values for key, values in evt_pattern.items()):
+            return TestEventPatternResponse(Result=False)
+        return TestEventPatternResponse(Result=True)
 
     @staticmethod
     def get_scheduled_rule_func(
@@ -133,9 +150,9 @@ class EventsProvider(EventsApi, ServiceLifecycleHook):
             if "minute" in unit:
                 return "*/%s * * * *" % value
             if "hour" in unit:
-                return "* */%s * * *" % value
+                return "0 */%s * * *" % value
             if "day" in unit:
-                return "* * */%s * *" % value
+                return "0 0 */%s * *" % value
             raise Exception("Unable to parse events schedule expression: %s" % schedule)
         return schedule
 
@@ -324,7 +341,7 @@ def check_valid_numeric_content_base_rule(list_of_operators):
     return True
 
 
-def filter_event_with_content_base_parameter(pattern_value, event_value):
+def filter_event_with_content_base_parameter(pattern_value: list, event_value: str | int):
     for element in pattern_value:
         if (isinstance(element, (str, int))) and (event_value == element or element in event_value):
             return True
@@ -448,7 +465,7 @@ def filter_event_based_on_event_format(
                         if not handle_prefix_filtering(value.get(key_a), value_a):
                             return False
 
-            # 2. check if the pattern is a list and event values are not contained in itEventsApi
+            # 2. check if the pattern is a list and event values are not contained in it
             if isinstance(value, list):
                 if identify_content_base_parameter_in_pattern(value):
                     if not filter_event_with_content_base_parameter(value, event_value):
@@ -548,6 +565,18 @@ def events_handler_put_events(self):
         if not matching_rules:
             continue
 
+        event_time = datetime.datetime.utcnow()
+        if event_timestamp := event.get("Time"):
+            try:
+                # if provided, use the time from event
+                event_time = datetime.datetime.utcfromtimestamp(event_timestamp)
+            except ValueError:
+                # if we can't parse it, pass and keep using `utcnow`
+                LOG.debug(
+                    "Could not parse the `Time` parameter, falling back to `utcnow` for the following Event: '%s'",
+                    event,
+                )
+
         # See https://docs.aws.amazon.com/AmazonS3/latest/userguide/ev-events.html
         formatted_event = {
             "version": "0",
@@ -555,7 +584,7 @@ def events_handler_put_events(self):
             "detail-type": event.get("DetailType"),
             "source": event.get("Source"),
             "account": get_aws_account_id(),
-            "time": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "time": event_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "region": self.region,
             "resources": event.get("Resources", []),
             "detail": json.loads(event.get("Detail", "{}")),

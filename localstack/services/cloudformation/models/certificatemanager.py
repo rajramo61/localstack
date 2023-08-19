@@ -1,5 +1,5 @@
+from localstack.aws.connect import connect_to
 from localstack.services.cloudformation.service_models import GenericBaseModel
-from localstack.utils.aws import aws_stack
 from localstack.utils.common import select_attributes
 
 
@@ -9,7 +9,7 @@ class CertificateManagerCertificate(GenericBaseModel):
         return "AWS::CertificateManager::Certificate"
 
     def fetch_state(self, stack_name, resources):
-        client = aws_stack.connect_to_service("acm")
+        client = connect_to().acm
         result = client.list_certificates().get("CertificateSummaryList", [])
         domain_name = self.props.get("DomainName")
         result = [c for c in result if c["DomainName"] == domain_name]
@@ -17,9 +17,11 @@ class CertificateManagerCertificate(GenericBaseModel):
 
     @classmethod
     def get_deploy_templates(cls):
-        def _create_params(params, *args, **kwargs):
+        def _create_params(
+            properties: dict, logical_resource_id: str, resource: dict, stack_name: str
+        ) -> dict:
             result = select_attributes(
-                params,
+                properties,
                 [
                     "CertificateAuthorityArn",
                     "DomainName",
@@ -48,8 +50,7 @@ class CertificateManagerCertificate(GenericBaseModel):
 
             return result
 
-        def _handle_result(result, resource_id, resources, resource_type):
-            resource = resources[resource_id]
+        def _handle_result(result: dict, logical_resource_id: str, resource: dict):
             resource["Properties"]["CertificateArn"] = resource["PhysicalResourceId"] = result[
                 "CertificateArn"
             ]

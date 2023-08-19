@@ -1,5 +1,5 @@
-import ast
 import base64
+import copy
 import json
 import logging
 from enum import Enum
@@ -9,6 +9,7 @@ from urllib.parse import quote_plus, unquote_plus
 from localstack import config
 from localstack.constants import APPLICATION_JSON
 from localstack.services.apigateway.context import ApiInvocationContext
+from localstack.services.apigateway.helpers import select_integration_response
 from localstack.utils.aws.templating import VelocityUtil, VtlTemplate
 from localstack.utils.json import extract_jsonpath, json_safe
 from localstack.utils.strings import to_str
@@ -176,10 +177,18 @@ class Templates:
         return self.vtl.render_vtl(template, variables=variables)
 
     @staticmethod
-    def build_variables_mapping(api_context: ApiInvocationContext):
+    def build_variables_mapping(api_context: ApiInvocationContext) -> dict[str, Any]:
         # TODO: make this (dict) an object so usages of "render_vtl" variables are defined
+        ctx = copy.deepcopy(api_context.context or {})
+        # https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-override-request-response-parameters.html
+        # create namespace for request override
+        ctx["requestOverride"] = {
+            "header": {},
+            "path": {},
+            "querystring": {},
+        }
         return {
-            "context": api_context.context or {},
+            "context": ctx,
             "stage_variables": api_context.stage_variables or {},
             "input": {
                 "body": api_context.data_as_string(),
@@ -203,7 +212,7 @@ class RequestTemplates(Templates):
     def render(
         self, api_context: ApiInvocationContext, template_key: str = APPLICATION_JSON
     ) -> Union[bytes, str]:
-        LOG.info(
+        LOG.debug(
             "Method request body before transformations: %s", to_str(api_context.data_as_string())
         )
         request_templates = api_context.integration.get("requestTemplates", {})
@@ -213,7 +222,13 @@ class RequestTemplates(Templates):
 
         variables = self.build_variables_mapping(api_context)
         result = self.render_vtl(template.strip(), variables=variables)
-        LOG.info(f"Endpoint request body after transformations:\n{result}")
+
+        # set the request overrides into context
+        api_context.headers.update(
+            variables.get("context", {}).get("requestOverride", {}).get("header", {})
+        )
+
+        LOG.debug(f"Endpoint request body after transformations:\n{result}")
         return result
 
 
@@ -254,15 +269,8 @@ class ResponseTemplates(Templates):
 
         # if there is integration response for the status code returned
         # by the integration we use the template configured for that status code
-        if status_code in integration_responses:
-            response_templates = integration_responses[status_code].get("responseTemplates", {})
-        else:
-            # if there is no integration response for the status code returned
-            # by the integration we use the first integration response status code
-            LOG.info(
-                f"Found multiple integration response status codes: {integration_status_codes}"
-            )
-            response_templates = integration_responses[0].get("responseTemplates", {})
+        selected_integration_response = select_integration_response(status_code, api_context)
+        response_templates = selected_integration_response.get("responseTemplates", {})
 
         # we only support JSON templates for now - if there is no template we return
         # the response as is
@@ -274,9 +282,21 @@ class ResponseTemplates(Templates):
 
         # we render the template with the context data and the response content
         variables = self.build_variables_mapping(api_context)
-        rendered_tpl = self.render_vtl(template, variables=variables)
+        response._content = self._render_as_json(template, variables)
 
-        # TODO: we need to do a parity test for templates that generate invalid JSON
-        response._content = json.dumps(ast.literal_eval(rendered_tpl.strip()))
-        LOG.info("Endpoint response body after transformations:\n%s", response._content)
+        LOG.debug("Endpoint response body after transformations:\n%s", response._content)
         return response._content
+
+    def _render_as_json(self, template: str, variables: dict[str, Any]) -> str:
+        """
+        Render the given Velocity template string + variables into a JSON string.
+        :raise JSONDecodeError: if template result is not valid JSON
+        :return: the template rendering result as a valid JSON string
+        """
+        rendered_tpl = self.render_vtl(template, variables=variables)
+        rendered_value = rendered_tpl.strip()
+        try:
+            return json.dumps(json.loads(rendered_value))
+        except Exception as e:
+            LOG.info("Unable to parse template result as JSON: %s - %s", e, rendered_value)
+            raise

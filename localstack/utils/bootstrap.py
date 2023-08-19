@@ -1,3 +1,4 @@
+import copy
 import functools
 import logging
 import os
@@ -7,7 +8,7 @@ import signal
 import threading
 import time
 from functools import wraps
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, Optional, Set
 
 from localstack import config, constants
 from localstack.config import get_edge_port_http, is_env_true
@@ -15,9 +16,11 @@ from localstack.constants import DEFAULT_VOLUME_DIR
 from localstack.runtime import hooks
 from localstack.utils.container_networking import get_main_container_name
 from localstack.utils.container_utils.container_client import (
+    ContainerConfiguration,
     ContainerException,
+    NoSuchImage,
+    NoSuchNetwork,
     PortMappings,
-    SimpleVolumeBind,
     VolumeBind,
     VolumeMappings,
 )
@@ -25,7 +28,7 @@ from localstack.utils.container_utils.docker_cmd_client import CmdDockerClient
 from localstack.utils.docker_utils import DOCKER_CLIENT
 from localstack.utils.files import cache_dir, mkdir
 from localstack.utils.functions import call_safe
-from localstack.utils.run import run, to_str
+from localstack.utils.run import is_command_available, run, to_str
 from localstack.utils.serving import Server
 from localstack.utils.sync import poll_condition
 from localstack.utils.tail import FileListener
@@ -244,7 +247,7 @@ def is_api_enabled(api: str) -> bool:
         return True
 
     for enabled_api in apis:
-        if api.startswith("%s:" % enabled_api):
+        if api.startswith(f"{enabled_api}:"):
             return True
 
     return False
@@ -267,17 +270,24 @@ def validate_localstack_config(name: str):
     compose_file_name = name if os.path.isabs(name) else os.path.join(dirname, name)
     warns = []
 
+    # some systems do not have "docker-compose" aliased to "docker compose", and older systems do not have
+    # "docker compose" at all. By preferring the old way and falling back on the new, we should get docker compose in
+    # any way, if installed
+    if is_command_available("docker-compose"):
+        compose_command = ["docker-compose"]
+    else:
+        compose_command = ["docker", "compose"]
     # validating docker-compose file
-    cmd = ["docker-compose", "-f", compose_file_name, "config"]
+    cmd = [*compose_command, "-f", compose_file_name, "config"]
     try:
         run(cmd, shell=False, print_error=False)
     except CalledProcessError as e:
         msg = f"{e}\n{to_str(e.output)}".strip()
         raise ValueError(msg)
 
-    # validating docker-compose variable
     import yaml  # keep import here to avoid issues in test Lambdas
 
+    # validating docker-compose variable
     with open(compose_file_name) as file:
         compose_content = yaml.full_load(file)
     services_config = compose_content.get("services", {})
@@ -295,12 +305,10 @@ def validate_localstack_config(name: str):
     image_name = ls_service_details.get("image", "")
     if image_name.split(":")[0] not in constants.OFFICIAL_IMAGES:
         warns.append(
-            'Using custom image "%s", we recommend using an official image: %s'
-            % (image_name, constants.OFFICIAL_IMAGES)
+            f'Using custom image "{image_name}", we recommend using an official image: {constants.OFFICIAL_IMAGES}'
         )
 
     # prepare config options
-    image_name = ls_service_details.get("image")
     container_name = ls_service_details.get("container_name") or ""
     docker_ports = (port.split(":")[-2] for port in ls_service_details.get("ports", []))
     docker_env = dict(
@@ -313,8 +321,7 @@ def validate_localstack_config(name: str):
 
     if (main_container not in container_name) and not docker_env.get("MAIN_CONTAINER_NAME"):
         warns.append(
-            'Please use "container_name: %s" or add "MAIN_CONTAINER_NAME" in "environment".'
-            % main_container
+            f'Please use "container_name: {main_container}" or add "MAIN_CONTAINER_NAME" in "environment".'
         )
 
     def port_exposed(port):
@@ -325,10 +332,9 @@ def validate_localstack_config(name: str):
     if not port_exposed(edge_port):
         warns.append(
             (
-                "Edge port %s is not exposed. You may have to add the entry "
+                f"Edge port {edge_port} is not exposed. You may have to add the entry "
                 'to the "ports" section of the docker-compose file.'
             )
-            % edge_port
         )
 
     # print warning/info messages
@@ -343,13 +349,6 @@ def get_docker_image_to_start():
     image_name = os.environ.get("IMAGE_NAME")
     if not image_name:
         image_name = constants.DOCKER_IMAGE_NAME
-        if os.environ.get("USE_LIGHT_IMAGE") in constants.FALSE_STRINGS:
-            # FIXME deprecated - remove with 2.0
-            LOG.warning(
-                "USE_LIGHT_IMAGE is deprecated (since 1.3.0) and will be removed in upcoming releases of LocalStack! "
-                "The localstack/localstack-full image is deprecated. Please remove this environment variable."
-            )
-            image_name = constants.DOCKER_IMAGE_NAME_FULL
         if is_api_key_configured():
             image_name = constants.DOCKER_IMAGE_NAME_PRO
     return image_name
@@ -369,82 +368,52 @@ def extract_port_flags(user_flags, port_mappings: PortMappings):
     return user_flags
 
 
-# TODO merge with docker_utils.py:ContainerConfiguration
 class LocalstackContainer:
-    name: str
-    image_name: str
-    volumes: VolumeMappings
-    ports: PortMappings
-    entrypoint: str
-    additional_flags: List[str]
-    command: List[str]
-
-    privileged: bool = True
-    remove: bool = True
-    interactive: bool = False
-    tty: bool = False
-    detach: bool = False
-    inherit_env: bool = True
-
-    logfile: Optional[str] = None
-    stdin: Optional[str] = None
-    user: Optional[str] = None
-    cap_add: Optional[List[str]] = None
-    network: Optional[str] = None
-    dns: Optional[str] = None
-    workdir: Optional[str] = None
+    config: ContainerConfiguration
 
     def __init__(self, name: str = None):
-        self.name = name or config.MAIN_CONTAINER_NAME
-        self.entrypoint = os.environ.get("ENTRYPOINT", "")
-        self.command = shlex.split(os.environ.get("CMD", ""))
-        self.image_name = get_docker_image_to_start()
-        self.ports = PortMappings(bind_host=config.EDGE_BIND_HOST)
-        self.volumes = VolumeMappings()
-        self.env_vars = {}
-        self.additional_flags = []
+        self.config = self._get_default_configuration(name)
+        self.logfile = os.path.join(config.dirs.tmp, f"{self.config.name}_container.log")
 
-        self.logfile = os.path.join(config.dirs.tmp, f"{self.name}_container.log")
+        self.additional_flags = []  # TODO: see comment in run()
 
-    def _get_mount_volumes(self) -> List[SimpleVolumeBind]:
-        # FIXME: VolumeMappings should be supported by the docker client
-        mount_volumes = []
-        for volume in self.volumes:
-            if isinstance(volume, tuple):
-                mount_volumes.append(volume)
-            elif isinstance(volume, VolumeBind):
-                mount_volumes.append((volume.host_dir, volume.container_dir))
-            else:
-                raise NotImplementedError("no support for volume type %s" % type(volume))
-
-        return mount_volumes
+    def _get_default_configuration(self, name: str = None) -> ContainerConfiguration:
+        """Returns a ContainerConfiguration populated with default values or values gathered from the
+        environment for starting the LocalStack container."""
+        return ContainerConfiguration(
+            image_name=get_docker_image_to_start(),
+            name=name or config.MAIN_CONTAINER_NAME,
+            volumes=VolumeMappings(),
+            remove=True,
+            # FIXME: update with https://github.com/localstack/localstack/pull/7991
+            ports=PortMappings(bind_host=config.EDGE_BIND_HOST),
+            entrypoint=os.environ.get("ENTRYPOINT"),
+            command=shlex.split(os.environ.get("CMD", "")) or None,
+            env_vars={},
+        )
 
     def run(self):
         if isinstance(DOCKER_CLIENT, CmdDockerClient):
             DOCKER_CLIENT.default_run_outfile = self.logfile
 
+        # FIXME: this is pretty awkward, but additional_flags in the LocalstackContainer API was always a
+        #  list of ["-e FOO=BAR", ...], whereas in the DockerClient it is expected to be a string. so we
+        #  need to re-assemble it here. the better way would be to not use additional_flags here all
+        #  together. it is still used in ext in `configure_pro_container` which could be refactored to use
+        #  the additional port bindings.
+        cfg = copy.deepcopy(self.config)
+        if not cfg.additional_flags:
+            cfg.additional_flags = ""
+        if self.additional_flags:
+            cfg.additional_flags += " " + " ".join(self.additional_flags)
+
+        # TODO: there could be a --network flag in `additional_flags`. we solve a similar problem for the
+        #  ports using `extract_port_flags`. maybe it would be better to consolidate all this into the
+        #  ContainerConfig object, like ContainerConfig.update_from_flags(str).
+        self._ensure_container_network(cfg.network)
+
         try:
-            return DOCKER_CLIENT.run_container(
-                image_name=self.image_name,
-                stdin=self.stdin,
-                name=self.name,
-                entrypoint=self.entrypoint or None,
-                remove=self.remove,
-                interactive=self.interactive,
-                tty=self.tty,
-                detach=self.detach,
-                command=self.command or None,
-                mount_volumes=self._get_mount_volumes(),
-                ports=self.ports,
-                env_vars=self.env_vars,
-                user=self.user,
-                cap_add=self.cap_add,
-                network=self.network,
-                dns=self.dns,
-                additional_flags=" ".join(self.additional_flags),
-                workdir=self.workdir,
-                privileged=self.privileged,
-            )
+            return DOCKER_CLIENT.run_container_from_config(cfg)
         except ContainerException as e:
             if LOG.isEnabledFor(logging.DEBUG):
                 LOG.exception("Error while starting LocalStack container")
@@ -454,9 +423,47 @@ class LocalstackContainer:
                 )
             raise
 
+    def _ensure_container_network(self, network: str):
+        """Makes sure the configured container network exists"""
+        if network:
+            if network in ["host", "bridge"]:
+                return
+            try:
+                DOCKER_CLIENT.inspect_network(network)
+            except NoSuchNetwork:
+                LOG.debug("Container network %s not found, creating it", network)
+                DOCKER_CLIENT.create_network(network)
+
     def truncate_log(self):
         with open(self.logfile, "wb") as fd:
             fd.write(b"")
+
+    # these properties are there to not break code that configures the container by using these values
+    # that code should ideally be refactored soon-ish to use the config instead.
+
+    @property
+    def env_vars(self) -> Dict[str, str]:
+        return self.config.env_vars
+
+    @property
+    def entrypoint(self) -> Optional[str]:
+        return self.config.entrypoint
+
+    @entrypoint.setter
+    def entrypoint(self, value: str):
+        self.config.entrypoint = value
+
+    @property
+    def name(self) -> str:
+        return self.config.name
+
+    @property
+    def volumes(self) -> VolumeMappings:
+        return self.config.volumes
+
+    @property
+    def ports(self) -> PortMappings:
+        return self.config.ports
 
 
 class LocalstackContainerServer(Server):
@@ -557,6 +564,24 @@ def configure_container(container: LocalstackContainer):
     container.privileged = True
 
 
+def configure_container_from_cli_params(container: LocalstackContainer, params: Dict[str, Any]):
+    # TODO: consolidate with container_client.Util.parse_additional_flags
+    # network flag
+    if params.get("network"):
+        container.config.network = params.get("network")
+
+    # parse environment variable flags
+    if params.get("env"):
+        for e in params.get("env"):
+            if "=" in e:
+                k, v = e.split("=", maxsplit=1)
+                container.config.env_vars[k] = v
+            else:
+                # there's currently no way in our abstraction to only pass the variable name (as you can do
+                # in docker) so we resolve the value here.
+                container.config.env_vars[e] = os.getenv(e)
+
+
 def configure_volume_mounts(container: LocalstackContainer):
     container.volumes.add(VolumeBind(config.VOLUME_DIR, DEFAULT_VOLUME_DIR))
 
@@ -580,18 +605,29 @@ def prepare_host(console):
     hooks.prepare_host.run()
 
 
-def start_infra_in_docker():
+def start_infra_in_docker(console, cli_params: Dict[str, Any] = None):
     prepare_docker_start()
 
-    container = LocalstackContainer()
-
     # create and prepare container
+    container = LocalstackContainer()
     configure_container(container)
+    if cli_params:
+        configure_container_from_cli_params(container, cli_params or {})
+    ensure_container_image(console, container)
 
-    container.truncate_log()
+    status = console.status("Starting LocalStack container")
+    status.start()
 
     # printing the container log is the current way we're occupying the terminal
-    log_printer = FileListener(container.logfile, print)
+    def _init_log_printer(line):
+        """Prints the console rule separator on the first line, then re-configures the callback to print."""
+        status.stop()
+        console.rule("LocalStack Runtime Log (press [bold][yellow]CTRL-C[/yellow][/bold] to quit)")
+        print(line)
+        log_printer.callback = print
+
+    container.truncate_log()
+    log_printer = FileListener(container.logfile, callback=_init_log_printer)
     log_printer.start()
 
     # Set up signal handler, to enable clean shutdown across different operating systems.
@@ -618,12 +654,28 @@ def start_infra_in_docker():
     try:
         server.start()
         server.join()
+        error = server.get_error()
+        if error:
+            # if the server failed, raise the error
+            raise error
     except KeyboardInterrupt:
         print("ok, bye!")
         shutdown_handler()
 
 
-def start_infra_in_docker_detached(console):
+def ensure_container_image(console, container: LocalstackContainer):
+    try:
+        DOCKER_CLIENT.inspect_image(container.config.image_name, pull=False)
+        return
+    except NoSuchImage:
+        console.log("container image not found on host")
+
+    with console.status(f"Pulling container image {container.config.image_name}"):
+        DOCKER_CLIENT.pull_image(container.config.image_name)
+        console.log("download complete")
+
+
+def start_infra_in_docker_detached(console, cli_params: Dict[str, Any] = None):
     """
     An alternative to start_infra_in_docker where the terminal is not blocked by the follow on the logfile.
     """
@@ -638,7 +690,11 @@ def start_infra_in_docker_detached(console):
     console.log("configuring container")
     container = LocalstackContainer()
     configure_container(container)
-    container.detach = True
+    if cli_params:
+        configure_container_from_cli_params(container, cli_params)
+    ensure_container_image(console, container)
+
+    container.config.detach = True
     container.truncate_log()
 
     # start the Localstack container as a Server

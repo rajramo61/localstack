@@ -21,13 +21,6 @@ class ECRRepository(GenericBaseModel):
     def cloudformation_type():
         return "AWS::ECR::Repository"
 
-    def get_cfn_attribute(self, attribute_name):
-        if attribute_name == "Arn":
-            return self.props.get("repositoryArn")
-        if attribute_name == "RepositoryUri":
-            return self.props.get("repositoryUri")
-        return super(ECRRepository, self).get_cfn_attribute(attribute_name)
-
     def fetch_state(self, stack_name, resources):
         repo_name = default_repos_per_stack.get(stack_name)
         if repo_name:
@@ -55,19 +48,18 @@ class ECRRepository(GenericBaseModel):
             if default_repos_per_stack.get(stack_name):
                 del default_repos_per_stack[stack_name]
 
-        def _set_physical_resource_id(result, resource_id, resources, resource_type):
-            resource = resources[resource_id]
+        def _handle_result(result: dict, logical_resource_id: str, resource: dict):
             repo_name = resource["Properties"]["RepositoryName"]
             resource["PhysicalResourceId"] = arns.get_ecr_repository_arn(repo_name)
 
             # add in some properties required for GetAtt and Ref
-            resource["Properties"]["repositoryArn"] = arns.get_ecr_repository_arn(repo_name)
-            resource["Properties"]["repositoryUri"] = "http://localhost:4566"
+            resource["Properties"]["Arn"] = arns.get_ecr_repository_arn(repo_name)
+            resource["Properties"]["RepositoryUri"] = "http://localhost:4566"
 
         return {
             "create": {
                 "function": _create_repo,
-                "result_handler": _set_physical_resource_id,
+                "result_handler": _handle_result,
             },
             "delete": {
                 "function": _delete_repo,

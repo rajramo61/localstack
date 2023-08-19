@@ -21,6 +21,7 @@ from localstack.aws.api.kms import (
     CreateGrantResponse,
     CreateKeyRequest,
     CreateKeyResponse,
+    DataKeyPairSpec,
     DateType,
     DecryptResponse,
     DeleteAliasRequest,
@@ -34,9 +35,7 @@ from localstack.aws.api.kms import (
     EncryptionContextType,
     EncryptResponse,
     ExpirationModelType,
-    GenerateDataKeyPairRequest,
     GenerateDataKeyPairResponse,
-    GenerateDataKeyPairWithoutPlaintextRequest,
     GenerateDataKeyPairWithoutPlaintextResponse,
     GenerateDataKeyRequest,
     GenerateDataKeyResponse,
@@ -78,6 +77,7 @@ from localstack.aws.api.kms import (
     MacAlgorithmSpec,
     MarkerType,
     NotFoundException,
+    NullableBooleanType,
     PlaintextType,
     PrincipalIdType,
     PutKeyPolicyRequest,
@@ -142,6 +142,9 @@ VALID_OPERATIONS = [
     "GenerateDataKeyPairWithoutPlaintext",
 ]
 
+# special tag name to allow specifying a custom ID for created keys
+TAG_KEY_CUSTOM_ID = "_custom_id_"
+
 
 class ValidationError(CommonServiceException):
     """General validation error type (defined in the AWS docs, but not part of the botocore spec)"""
@@ -199,7 +202,15 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
     ) -> KmsKey:
         store = kms_stores[account_id][region_name]
         key = KmsKey(request, account_id, region_name)
-        key_id = key.metadata.get("KeyId")
+
+        # check if the _custom_id_ tag is specified, to set a user-defined KeyId for this key
+        tags_dict = {tag["TagKey"]: tag["TagValue"] for tag in request.get("Tags", [])}
+        custom_id = tags_dict.get(TAG_KEY_CUSTOM_ID)
+        if custom_id and custom_id.strip():
+            key.metadata["KeyId"] = custom_id.strip()
+            key.calculate_and_set_arn(account_id=account_id, region=region_name)
+
+        key_id = key.metadata["KeyId"]
         store.keys[key_id] = key
         return key
 
@@ -590,8 +601,13 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         store.grants.pop(grant_id)
 
     def revoke_grant(
-        self, context: RequestContext, key_id: KeyIdType, grant_id: GrantIdType
+        self,
+        context: RequestContext,
+        key_id: KeyIdType,
+        grant_id: GrantIdType,
+        dry_run: NullableBooleanType = None,
     ) -> None:
+        # TODO add support for "dry_run"
         key_account_id, key_region_name, key_id = self._parse_key_id(key_id, context)
         key = self._get_kms_key(key_account_id, key_region_name, key_id, any_key_state_allowed=True)
         key_id = key.metadata.get("KeyId")
@@ -609,7 +625,9 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         grant_token: GrantTokenType = None,
         key_id: KeyIdType = None,
         grant_id: GrantIdType = None,
+        dry_run: NullableBooleanType = None,
     ) -> None:
+        # TODO add support for "dry_run"
         if not grant_token and (not grant_id or not key_id):
             raise ValidationException("Grant token OR (grant ID, key ID) must be specified")
 
@@ -686,7 +704,13 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         result["KeyId"] = key.metadata["Arn"]
         return GetPublicKeyResponse(**result)
 
-    def _generate_data_key_pair(self, key_id: str, key_pair_spec: str, context: RequestContext):
+    def _generate_data_key_pair(
+        self,
+        context: RequestContext,
+        key_id: str,
+        key_pair_spec: str,
+        encryption_context: EncryptionContextType = None,
+    ):
         account_id, region_name, key_id = self._parse_key_id(key_id, context)
         key = self._get_kms_key(account_id, region_name, key_id)
         self._validate_key_for_encryption_decryption(context, key)
@@ -694,18 +718,24 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         return {
             "KeyId": key.metadata["Arn"],
             "KeyPairSpec": key_pair_spec,
-            "PrivateKeyCiphertextBlob": key.encrypt(crypto_key.private_key),
+            "PrivateKeyCiphertextBlob": key.encrypt(crypto_key.private_key, encryption_context),
             "PrivateKeyPlaintext": crypto_key.private_key,
             "PublicKey": crypto_key.public_key,
         }
 
-    @handler("GenerateDataKeyPair", expand=False)
+    @handler("GenerateDataKeyPair")
     def generate_data_key_pair(
-        self, context: RequestContext, request: GenerateDataKeyPairRequest
+        self,
+        context: RequestContext,
+        key_id: KeyIdType,
+        key_pair_spec: DataKeyPairSpec,
+        encryption_context: EncryptionContextType = None,
+        grant_tokens: GrantTokenList = None,
+        recipient: RecipientInfo = None,
+        dry_run: NullableBooleanType = None,
     ) -> GenerateDataKeyPairResponse:
-        result = self._generate_data_key_pair(
-            request.get("KeyId"), request.get("KeyPairSpec"), context
-        )
+        # TODO add support for "dry_run"
+        result = self._generate_data_key_pair(context, key_id, key_pair_spec, encryption_context)
         return GenerateDataKeyPairResponse(**result)
 
     @handler("GenerateRandom", expand=False)
@@ -730,15 +760,18 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
 
         return GenerateRandomResponse(Plaintext=byte_string)
 
-    @handler("GenerateDataKeyPairWithoutPlaintext", expand=False)
+    @handler("GenerateDataKeyPairWithoutPlaintext")
     def generate_data_key_pair_without_plaintext(
         self,
         context: RequestContext,
-        request: GenerateDataKeyPairWithoutPlaintextRequest,
+        key_id: KeyIdType,
+        key_pair_spec: DataKeyPairSpec,
+        encryption_context: EncryptionContextType = None,
+        grant_tokens: GrantTokenList = None,
+        dry_run: NullableBooleanType = None,
     ) -> GenerateDataKeyPairWithoutPlaintextResponse:
-        result = self._generate_data_key_pair(
-            request.get("KeyId"), request.get("KeyPairSpec"), context
-        )
+        # TODO add support for "dry_run"
+        result = self._generate_data_key_pair(context, key_id, key_pair_spec, encryption_context)
         result.pop("PrivateKeyPlaintext")
         return GenerateDataKeyPairResponse(**result)
 
@@ -877,6 +910,7 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         source_encryption_algorithm: EncryptionAlgorithmSpec = None,
         destination_encryption_algorithm: EncryptionAlgorithmSpec = None,
         grant_tokens: GrantTokenList = None,
+        dry_run: NullableBooleanType = None,
     ) -> ReEncryptResponse:
         # TODO: when implementing, ensure cross-account support for source_key_id and destination_key_id
         raise NotImplementedError
@@ -889,7 +923,9 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         encryption_context: EncryptionContextType = None,
         grant_tokens: GrantTokenList = None,
         encryption_algorithm: EncryptionAlgorithmSpec = None,
+        dry_run: NullableBooleanType = None,
     ) -> EncryptResponse:
+        # TODO add support for "dry_run"
         account_id, region_name, key_id = self._parse_key_id(key_id, context)
         key = self._get_kms_key(account_id, region_name, key_id)
         self._validate_plaintext_length(plaintext)
@@ -916,6 +952,7 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         key_id: KeyIdType = None,
         encryption_algorithm: EncryptionAlgorithmSpec = None,
         recipient: RecipientInfo = None,
+        dry_run: NullableBooleanType = None,
     ) -> DecryptResponse:
         # In AWS, key_id is only supplied for data encrypted with an asymmetrical algorithm. For symmetrical
         # encryption, key_id is taken from the encrypted data itself.
@@ -950,6 +987,7 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         # in its docs.
         # TODO add support for "recipient"
         #  https://docs.aws.amazon.com/kms/latest/APIReference/API_Decrypt.html#API_Decrypt_RequestSyntax
+        # TODO add support for "dry_run"
         return DecryptResponse(
             KeyId=key.metadata.get("Arn"),
             Plaintext=plaintext,

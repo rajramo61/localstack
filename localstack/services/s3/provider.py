@@ -1,8 +1,12 @@
+import copy
 import datetime
 import logging
 import os
+from collections import defaultdict
+from operator import itemgetter
 from typing import IO, Dict, List, Optional
 from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
+from zoneinfo import ZoneInfo
 
 import moto.s3.responses as moto_s3_responses
 
@@ -11,12 +15,12 @@ from localstack.aws.accounts import get_aws_account_id
 from localstack.aws.api import CommonServiceException, RequestContext, ServiceException, handler
 from localstack.aws.api.s3 import (
     MFA,
-    AccessControlPolicy,
     AccountId,
     AnalyticsConfiguration,
     AnalyticsConfigurationList,
     AnalyticsId,
     Body,
+    BucketLoggingStatus,
     BucketName,
     BypassGovernanceRetention,
     ChecksumAlgorithm,
@@ -30,6 +34,7 @@ from localstack.aws.api.s3 import (
     CreateBucketRequest,
     CreateMultipartUploadOutput,
     CreateMultipartUploadRequest,
+    CrossLocationLoggingProhibitted,
     Delete,
     DeleteObjectOutput,
     DeleteObjectRequest,
@@ -37,13 +42,18 @@ from localstack.aws.api.s3 import (
     DeleteObjectTaggingOutput,
     DeleteObjectTaggingRequest,
     ETag,
+    Expiration,
+    Expression,
+    ExpressionType,
     GetBucketAclOutput,
     GetBucketAnalyticsConfigurationOutput,
     GetBucketCorsOutput,
     GetBucketIntelligentTieringConfigurationOutput,
+    GetBucketInventoryConfigurationOutput,
     GetBucketLifecycleConfigurationOutput,
     GetBucketLifecycleOutput,
     GetBucketLocationOutput,
+    GetBucketLoggingOutput,
     GetBucketReplicationOutput,
     GetBucketRequestPaymentOutput,
     GetBucketRequestPaymentRequest,
@@ -54,18 +64,25 @@ from localstack.aws.api.s3 import (
     GetObjectAttributesRequest,
     GetObjectOutput,
     GetObjectRequest,
+    GetObjectRetentionOutput,
     GetObjectTaggingOutput,
     GetObjectTaggingRequest,
     HeadObjectOutput,
     HeadObjectRequest,
+    InputSerialization,
     IntelligentTieringConfiguration,
     IntelligentTieringConfigurationList,
     IntelligentTieringId,
-    InvalidBucketName,
+    InvalidArgument,
     InvalidPartOrder,
     InvalidStorageClass,
+    InvalidTargetBucketForLogging,
+    InventoryConfiguration,
+    InventoryId,
+    LifecycleRules,
     ListBucketAnalyticsConfigurationsOutput,
     ListBucketIntelligentTieringConfigurationsOutput,
+    ListBucketInventoryConfigurationsOutput,
     ListMultipartUploadsOutput,
     ListMultipartUploadsRequest,
     ListObjectsOutput,
@@ -83,9 +100,12 @@ from localstack.aws.api.s3 import (
     NotificationConfiguration,
     ObjectIdentifier,
     ObjectKey,
+    ObjectLockRetention,
     ObjectLockToken,
     ObjectVersionId,
+    OutputSerialization,
     PostResponse,
+    PreconditionFailed,
     PutBucketAclRequest,
     PutBucketLifecycleConfigurationRequest,
     PutBucketLifecycleRequest,
@@ -95,18 +115,29 @@ from localstack.aws.api.s3 import (
     PutObjectAclRequest,
     PutObjectOutput,
     PutObjectRequest,
+    PutObjectRetentionOutput,
     PutObjectTaggingOutput,
     PutObjectTaggingRequest,
     ReplicationConfiguration,
     ReplicationConfigurationNotFoundError,
     RequestPayer,
+    RequestProgress,
+    RestoreObjectOutput,
+    RestoreObjectRequest,
     S3Api,
+    ScanRange,
+    SelectObjectContentOutput,
     SkipValidation,
+    SSECustomerAlgorithm,
+    SSECustomerKey,
+    SSECustomerKeyMD5,
     StorageClass,
     Token,
+    UploadPartOutput,
+    UploadPartRequest,
+    WebsiteConfiguration,
 )
-from localstack.aws.api.s3 import Type as GranteeType
-from localstack.aws.api.s3 import UploadPartOutput, UploadPartRequest, WebsiteConfiguration
+from localstack.aws.forwarder import NotImplementedAvoidFallbackError
 from localstack.aws.handlers import (
     modify_service_response,
     preprocess_request,
@@ -116,8 +147,15 @@ from localstack.services.edge import ROUTER
 from localstack.services.moto import call_moto
 from localstack.services.plugins import ServiceLifecycleHook
 from localstack.services.s3 import constants as s3_constants
+from localstack.services.s3.codec import AwsChunkedDecoder
 from localstack.services.s3.cors import S3CorsHandler, s3_cors_request_handler
-from localstack.services.s3.models import S3Store, get_moto_s3_backend, s3_stores
+from localstack.services.s3.exceptions import (
+    InvalidRequest,
+    MalformedXML,
+    NoSuchConfiguration,
+    UnexpectedContent,
+)
+from localstack.services.s3.models import BucketCorsIndex, S3Store, get_moto_s3_backend, s3_stores
 from localstack.services.s3.notifications import NotificationDispatcher, S3EventNotificationContext
 from localstack.services.s3.presigned_url import (
     s3_presigned_url_request_handler,
@@ -125,18 +163,28 @@ from localstack.services.s3.presigned_url import (
     validate_post_policy,
 )
 from localstack.services.s3.utils import (
-    _create_invalid_argument_exc,
     capitalize_header_name_from_snake_case,
+    extract_bucket_key_version_id_from_copy_source,
     get_bucket_from_moto,
-    get_header_name,
+    get_failed_precondition_copy_source,
     get_key_from_moto_bucket,
+    get_lifecycle_rule_from_object,
     get_object_checksum_for_algorithm,
-    is_bucket_name_valid,
-    is_canned_acl_bucket_valid,
     is_key_expired,
-    is_valid_canonical_id,
+    serialize_expiration_header,
     validate_kms_key_id,
     verify_checksum,
+)
+from localstack.services.s3.validation import (
+    validate_acl_acp,
+    validate_bucket_analytics_configuration,
+    validate_bucket_intelligent_tiering_configuration,
+    validate_bucket_name,
+    validate_canned_acl,
+    validate_grantee_in_headers,
+    validate_inventory_configuration,
+    validate_lifecycle_configuration,
+    validate_website_configuration,
 )
 from localstack.services.s3.website_hosting import register_website_hosting_routes
 from localstack.utils.aws import arns, aws_stack
@@ -144,6 +192,7 @@ from localstack.utils.aws.arns import s3_bucket_name
 from localstack.utils.collections import get_safe
 from localstack.utils.patch import patch
 from localstack.utils.strings import short_uid
+from localstack.utils.time import parse_timestamp
 from localstack.utils.urls import localstack_host
 
 LOG = logging.getLogger(__name__)
@@ -155,33 +204,6 @@ os.environ[
 MOTO_CANONICAL_USER_ID = "75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a"
 # max file size for S3 objects kept in memory (500 KB by default)
 S3_MAX_FILE_SIZE_BYTES = 512 * 1024
-
-
-class MalformedXML(CommonServiceException):
-    def __init__(self, message=None):
-        if not message:
-            message = "The XML you provided was not well-formed or did not validate against our published schema"
-        super().__init__("MalformedXML", status_code=400, message=message)
-
-
-class MalformedACLError(CommonServiceException):
-    def __init__(self, message=None):
-        super().__init__("MalformedACLError", status_code=400, message=message)
-
-
-class InvalidRequest(CommonServiceException):
-    def __init__(self, message=None):
-        super().__init__("InvalidRequest", status_code=400, message=message)
-
-
-class UnexpectedContent(CommonServiceException):
-    def __init__(self, message=None):
-        super().__init__("UnexpectedContent", status_code=400, message=message)
-
-
-class NoSuchConfiguration(CommonServiceException):
-    def __init__(self, message=None):
-        super().__init__("NoSuchConfiguration", status_code=404, message=message)
 
 
 def get_full_default_bucket_location(bucket_name):
@@ -211,6 +233,9 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         store.bucket_notification_configs.pop(bucket, None)
         store.bucket_replication.pop(bucket, None)
         store.bucket_website_configuration.pop(bucket, None)
+        store.bucket_analytics_configuration.pop(bucket, None)
+        store.bucket_intelligent_tiering_configuration.pop(bucket, None)
+        self._expiration_cache.pop(bucket, None)
 
     def on_after_init(self):
         apply_moto_patches()
@@ -223,7 +248,10 @@ class S3Provider(S3Api, ServiceLifecycleHook):
     def __init__(self) -> None:
         super().__init__()
         self._notification_dispatcher = NotificationDispatcher()
-        self._cors_handler = S3CorsHandler()
+        self._cors_handler = S3CorsHandler(BucketCorsIndex())
+        # runtime cache of Lifecycle Expiration headers, as they need to be calculated everytime we fetch an object
+        # in case the rules have changed
+        self._expiration_cache: dict[BucketName, dict[ObjectKey, Expiration]] = defaultdict(dict)
 
     def on_before_stop(self):
         self._notification_dispatcher.shutdown()
@@ -240,7 +268,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             s3_notif_ctx = S3EventNotificationContext.from_request_context(
                 context, key_name=key_name
             )
-        if notification_config := self.get_store().bucket_notification_configs.get(
+        if notification_config := self.get_store(context).bucket_notification_configs.get(
             s3_notif_ctx.bucket_name
         ):
             self._notification_dispatcher.send_notifications(s3_notif_ctx, notification_config)
@@ -255,6 +283,34 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         self._notification_dispatcher.verify_configuration(
             notification_configuration, skip_destination_validation, context, bucket_name
         )
+
+    def _get_expiration_header(
+        self, lifecycle_rules: LifecycleRules, moto_object, object_tags
+    ) -> Expiration:
+        """
+        This method will check if the key matches a Lifecycle filter, and return the serializer header if that's
+        the case. We're caching it because it can change depending on the set rules on the bucket.
+        We can't use `lru_cache` as the parameters needs to be hashable
+        :param lifecycle_rules: the bucket LifecycleRules
+        :param moto_object: FakeKey from moto
+        :param object_tags: the object tags
+        :return: the Expiration header if there's a rule matching
+        """
+        if cached_exp := self._expiration_cache.get(moto_object.bucket_name, {}).get(
+            moto_object.name
+        ):
+            return cached_exp
+
+        if lifecycle_rule := get_lifecycle_rule_from_object(
+            lifecycle_rules, moto_object.name, moto_object.size, object_tags
+        ):
+            expiration_header = serialize_expiration_header(
+                lifecycle_rule["ID"],
+                lifecycle_rule["Expiration"],
+                moto_object.last_modified,
+            )
+            self._expiration_cache[moto_object.bucket_name][moto_object.name] = expiration_header
+            return expiration_header
 
     @handler("CreateBucket", expand=False)
     def create_bucket(
@@ -373,6 +429,36 @@ class S3Provider(S3Api, ServiceLifecycleHook):
     ) -> HeadObjectOutput:
         response: HeadObjectOutput = call_moto(context)
         response["AcceptRanges"] = "bytes"
+
+        key = request["Key"]
+        bucket = request["Bucket"]
+        moto_backend = get_moto_s3_backend(context)
+        moto_bucket = get_bucket_from_moto(moto_backend, bucket=bucket)
+        key_object = get_key_from_moto_bucket(moto_bucket, key=key)
+
+        if (checksum_algorithm := key_object.checksum_algorithm) and not response.get(
+            "ContentEncoding"
+        ):
+            # this is a bug in AWS: it sets the content encoding header to an empty string (parity tested) if it's not
+            # set to something
+            response["ContentEncoding"] = ""
+
+        if (request.get("ChecksumMode") or "").upper() == "ENABLED" and checksum_algorithm:
+            response[f"Checksum{checksum_algorithm.upper()}"] = key_object.checksum_value  # noqa
+
+        if not request.get("VersionId"):
+            store = self.get_store(context)
+            if (
+                bucket_lifecycle_config := store.bucket_lifecycle_configuration.get(
+                    request["Bucket"]
+                )
+            ) and (rules := bucket_lifecycle_config.get("Rules")):
+                object_tags = moto_backend.tagger.get_tag_dict_for_resource(key_object.arn)
+                if expiration_header := self._get_expiration_header(rules, key_object, object_tags):
+                    # TODO: we either apply the lifecycle to existing objects when we set the new rules, or we need to
+                    #  apply them everytime we get/head an object
+                    response["Expiration"] = expiration_header
+
         return response
 
     @handler("GetObject", expand=False)
@@ -387,8 +473,9 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             raise NoSuchKey("The specified key does not exist.", Key=key)
 
         response: GetObjectOutput = call_moto(context)
+        store = self.get_store(context)
         # check for the presence in the response, was fixed by moto but incompletely
-        if bucket in self.get_store().bucket_versioning_status and "VersionId" not in response:
+        if bucket in store.bucket_versioning_status and "VersionId" not in response:
             response["VersionId"] = "null"
 
         for request_param, response_param in s3_constants.ALLOWED_HEADER_OVERRIDES.items():
@@ -402,18 +489,25 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         if not config.S3_SKIP_KMS_KEY_VALIDATION and key_object.kms_key_id:
             validate_kms_key_id(kms_key=key_object.kms_key_id, bucket=moto_bucket)
 
-        if checksum_algorithm := key_object.checksum_algorithm:
-            # this is a bug in AWS: it sets the content encoding header to an empty string (parity tested)
+        if (checksum_algorithm := key_object.checksum_algorithm) and not response.get(
+            "ContentEncoding"
+        ):
+            # this is a bug in AWS: it sets the content encoding header to an empty string (parity tested) if it's not
+            # set to something
             response["ContentEncoding"] = ""
 
-        if request.get("ChecksumMode") == "ENABLED" and checksum_algorithm:
-            # TODO: moto does not store the checksum of object, there is a TODO there as well
-            # in the meantime, just compute the hash everytime it's requested
-            checksum = get_object_checksum_for_algorithm(
-                checksum_algorithm=checksum_algorithm,
-                data=key_object.value,
-            )
-            response[f"Checksum{checksum_algorithm.upper()}"] = checksum  # noqa
+        if (request.get("ChecksumMode") or "").upper() == "ENABLED" and checksum_algorithm:
+            response[f"Checksum{key_object.checksum_algorithm.upper()}"] = key_object.checksum_value
+
+        if not version_id and (
+            (bucket_lifecycle_config := store.bucket_lifecycle_configuration.get(request["Bucket"]))
+            and (rules := bucket_lifecycle_config.get("Rules"))
+        ):
+            object_tags = moto_backend.tagger.get_tag_dict_for_resource(key_object.arn)
+            if expiration_header := self._get_expiration_header(rules, key_object, object_tags):
+                # TODO: we either apply the lifecycle to existing objects when we set the new rules, or we need to
+                #  apply them everytime we get/head an object
+                response["Expiration"] = expiration_header
 
         response["AcceptRanges"] = "bytes"
         return response
@@ -466,6 +560,22 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             )
             response["SSEKMSKeyId"] = key_object.kms_key_id
 
+        if key_object.checksum_algorithm == ChecksumAlgorithm.CRC32C:
+            # moto does not support CRC32C yet, it uses CRC32 instead
+            # recalculate the proper checksum to store in the key
+            key_object.checksum_value = get_object_checksum_for_algorithm(
+                ChecksumAlgorithm.CRC32C,
+                key_object.value,
+            )
+
+        bucket_lifecycle_configurations = self.get_store(context).bucket_lifecycle_configuration
+        if (bucket_lifecycle_config := bucket_lifecycle_configurations.get(request["Bucket"])) and (
+            rules := bucket_lifecycle_config.get("Rules")
+        ):
+            object_tags = moto_backend.tagger.get_tag_dict_for_resource(key_object.arn)
+            if expiration_header := self._get_expiration_header(rules, key_object, object_tags):
+                response["Expiration"] = expiration_header
+
         self._notify(context)
 
         return response
@@ -476,12 +586,63 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         context: RequestContext,
         request: CopyObjectRequest,
     ) -> CopyObjectOutput:
+        moto_backend = get_moto_s3_backend(context)
+        dest_moto_bucket = get_bucket_from_moto(moto_backend, bucket=request["Bucket"])
         if not config.S3_SKIP_KMS_KEY_VALIDATION and (sse_kms_key_id := request.get("SSEKMSKeyId")):
-            moto_backend = get_moto_s3_backend(context)
-            bucket = get_bucket_from_moto(moto_backend, bucket=request["Bucket"])
-            validate_kms_key_id(sse_kms_key_id, bucket)
+            validate_kms_key_id(sse_kms_key_id, dest_moto_bucket)
+
+        src_bucket, src_key, src_version_id = extract_bucket_key_version_id_from_copy_source(
+            request["CopySource"]
+        )
+        src_moto_bucket = get_bucket_from_moto(moto_backend, bucket=src_bucket)
+        source_key_object = get_key_from_moto_bucket(
+            src_moto_bucket, key=src_key, version_id=src_version_id
+        )
+
+        # see https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html
+        source_object_last_modified = source_key_object.last_modified.replace(
+            tzinfo=ZoneInfo("GMT")
+        )
+        if failed_condition := get_failed_precondition_copy_source(
+            request, source_object_last_modified, source_key_object.etag
+        ):
+            raise PreconditionFailed(
+                "At least one of the pre-conditions you specified did not hold",
+                Condition=failed_condition,
+            )
 
         response: CopyObjectOutput = call_moto(context)
+
+        # we properly calculate the Checksum for the destination Key
+        checksum_algorithm = (
+            request.get("ChecksumAlgorithm") or source_key_object.checksum_algorithm
+        )
+        if checksum_algorithm:
+            dest_key_object = get_key_from_moto_bucket(dest_moto_bucket, key=request["Key"])
+            dest_key_object.checksum_algorithm = checksum_algorithm
+
+            if (
+                not source_key_object.checksum_value
+                or checksum_algorithm == ChecksumAlgorithm.CRC32C
+            ):
+                dest_key_object.checksum_value = get_object_checksum_for_algorithm(
+                    checksum_algorithm, dest_key_object.value
+                )
+            else:
+                dest_key_object.checksum_value = source_key_object.checksum_value
+
+            if checksum_algorithm == ChecksumAlgorithm.CRC32C:
+                # TODO: the logic for rendering the template in moto is the following:
+                # if `CRC32` in `key.checksum_algorithm` which is valid for both CRC32 and CRC32C, and will render both
+                # remove the key if it's CRC32C.
+                response["CopyObjectResult"].pop("ChecksumCRC32", None)
+
+            dest_key_object.checksum_algorithm = checksum_algorithm
+
+            response["CopyObjectResult"][
+                f"Checksum{checksum_algorithm.upper()}"
+            ] = dest_key_object.checksum_value  # noqa
+
         self._notify(context)
         return response
 
@@ -492,7 +653,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         request: DeleteObjectRequest,
     ) -> DeleteObjectOutput:
         # TODO: implement DeleteMarker response
-        if request["Bucket"] not in self.get_store().bucket_notification_configs:
+        if request["Bucket"] not in self.get_store(context).bucket_notification_configs:
             return call_moto(context)
 
         # TODO: we do not differentiate between deleting a key and creating a DeleteMarker in a versioned bucket
@@ -609,8 +770,39 @@ class S3Provider(S3Api, ServiceLifecycleHook):
                 "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
                 UploadId=upload_id,
             )
+        elif (part_number := request.get("PartNumber", 0)) < 1 or part_number > 10000:
+            raise InvalidArgument(
+                "Part number must be an integer between 1 and 10000, inclusive",
+                ArgumentName="partNumber",
+                ArgumentValue=part_number,
+            )
 
-        response: UploadPartOutput = call_moto(context)
+        body = request.get("Body")
+        headers = context.request.headers
+        # AWS specifies that the `Content-Encoding` should be `aws-chunked`, but some SDK don't set it.
+        # Rely on the `x-amz-content-sha256` which is a more reliable indicator that the request is streamed
+        content_sha_256 = (headers.get("x-amz-content-sha256") or "").upper()
+        if body and content_sha_256 and content_sha_256.startswith("STREAMING-"):
+            # this is a chunked request, we need to properly decode it while setting the key value
+            decoded_content_length = int(headers.get("x-amz-decoded-content-length", 0))
+            body = AwsChunkedDecoder(body, decoded_content_length)
+
+        part = body.read() if body else b""
+
+        # we are directly using moto backend and not calling moto because to get the response, moto calls
+        # key.response_dict, which in turns tries to access the tags of part, indirectly creating a BackendDict
+        # with an account_id set to None (because moto does not set an account_id to the FakeKey representing a Part)
+        key = moto_backend.upload_part(bucket_name, upload_id, part_number, part)
+        response = UploadPartOutput(ETag=key.etag)
+
+        if key.encryption is not None:
+            response["ServerSideEncryption"] = key.encryption
+            if key.encryption == "aws:kms" and key.kms_key_id is not None:
+                response["SSEKMSKeyId"] = key.encryption
+
+        if key.encryption == "aws:kms" and key.bucket_key_enabled is not None:
+            response["BucketKeyEnabled"] = key.bucket_key_enabled
+
         return response
 
     @handler("ListMultipartUploads", expand=False)
@@ -677,7 +869,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # we can't add the VersionId for now
         if (
             "VersionId" in response
-            and request["Bucket"] not in self.get_store().bucket_versioning_status
+            and request["Bucket"] not in self.get_store(context).bucket_versioning_status
         ):
             response.pop("VersionId")
         return response
@@ -741,12 +933,13 @@ class S3Provider(S3Api, ServiceLifecycleHook):
                 "Versioning must be 'Enabled' on the bucket to apply a replication configuration"
             )
 
-        for rule in replication_configuration.get("Rules", {}):
+        if not (rules := replication_configuration.get("Rules")):
+            raise MalformedXML()
+
+        for rule in rules:
             if "ID" not in rule:
                 rule["ID"] = short_uid()
 
-        store = self.get_store()
-        for rule in replication_configuration.get("Rules", []):
             dst = rule.get("Destination", {}).get("Bucket")
             dst_bucket_name = s3_bucket_name(dst)
             dst_bucket = None
@@ -759,6 +952,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
                 raise InvalidRequest("Destination bucket must have versioning enabled.")
 
         # TODO more validation on input
+        store = self.get_store(context)
         store.bucket_replication[bucket] = replication_configuration
 
     def get_bucket_replication(
@@ -768,7 +962,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket=bucket)
 
-        store = self.get_store()
+        store = self.get_store(context)
         replication = store.bucket_replication.get(bucket, None)
         if not replication:
             ex = ReplicationConfigurationNotFoundError(
@@ -793,7 +987,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket=bucket)
 
-        store = self.get_store()
+        store = self.get_store(context)
         bucket_lifecycle = store.bucket_lifecycle_configuration.get(bucket)
         if not bucket_lifecycle:
             ex = NoSuchLifecycleConfiguration("The lifecycle configuration does not exist")
@@ -827,9 +1021,15 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         bucket = request["Bucket"]
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket=bucket)
-        store = self.get_store()
-        # TODO: add validation on the BucketLifecycleConfiguration
-        store.bucket_lifecycle_configuration[bucket] = request.get("LifecycleConfiguration")
+        lifecycle_conf = request.get("LifecycleConfiguration")
+        validate_lifecycle_configuration(lifecycle_conf)
+        # TODO: we either apply the lifecycle to existing objects when we set the new rules, or we need to apply them
+        #  everytime we get/head an object
+        # for now, we keep a cache and get it everytime we fetch an object, as it's easier to invalidate than
+        # iterating over every single key to set the Expiration header to None
+        store = self.get_store(context)
+        store.bucket_lifecycle_configuration[bucket] = lifecycle_conf
+        self._expiration_cache[bucket].clear()
 
     def delete_bucket_lifecycle(
         self, context: RequestContext, bucket: BucketName, expected_bucket_owner: AccountId = None
@@ -838,8 +1038,9 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket=bucket)
 
-        store = self.get_store()
+        store = self.get_store(context)
         store.bucket_lifecycle_configuration.pop(bucket, None)
+        self._expiration_cache[bucket].clear()
 
     def put_bucket_cors(
         self,
@@ -887,6 +1088,62 @@ class S3Provider(S3Api, ServiceLifecycleHook):
                 grantee["DisplayName"] = "webfile"
 
         return response
+
+    def get_object_retention(
+        self,
+        context: RequestContext,
+        bucket: BucketName,
+        key: ObjectKey,
+        version_id: ObjectVersionId = None,
+        request_payer: RequestPayer = None,
+        expected_bucket_owner: AccountId = None,
+    ) -> GetObjectRetentionOutput:
+        moto_backend = get_moto_s3_backend(context)
+        key = get_key_from_moto_bucket(
+            get_bucket_from_moto(moto_backend, bucket=bucket), key=key, version_id=version_id
+        )
+        if not key.lock_mode and not key.lock_until:
+            raise InvalidRequest("Bucket is missing Object Lock Configuration")
+        return GetObjectRetentionOutput(
+            Retention=ObjectLockRetention(
+                Mode=key.lock_mode,
+                RetainUntilDate=parse_timestamp(key.lock_until),
+            )
+        )
+
+    @handler("PutObjectRetention")
+    def put_object_retention(
+        self,
+        context: RequestContext,
+        bucket: BucketName,
+        key: ObjectKey,
+        retention: ObjectLockRetention = None,
+        request_payer: RequestPayer = None,
+        version_id: ObjectVersionId = None,
+        bypass_governance_retention: BypassGovernanceRetention = None,
+        content_md5: ContentMD5 = None,
+        checksum_algorithm: ChecksumAlgorithm = None,
+        expected_bucket_owner: AccountId = None,
+    ) -> PutObjectRetentionOutput:
+        moto_backend = get_moto_s3_backend(context)
+        moto_bucket = get_bucket_from_moto(moto_backend, bucket=bucket)
+
+        try:
+            moto_key = get_key_from_moto_bucket(moto_bucket, key=key, version_id=version_id)
+        except NoSuchKey:
+            moto_key = None
+
+        if not moto_key and version_id:
+            raise InvalidArgument("Invalid version id specified")
+        if not moto_bucket.object_lock_enabled:
+            raise InvalidRequest("Bucket is missing Object Lock Configuration")
+        if not moto_key and not version_id:
+            raise NoSuchKey("The specified key does not exist.", Key=key)
+
+        moto_key.lock_mode = retention.get("Mode")
+        retention_date = retention.get("RetainUntilDate")
+        retention_date = retention_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        moto_key.lock_until = retention_date
 
     @handler("PutBucketAcl", expand=False)
     def put_bucket_acl(
@@ -1003,7 +1260,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # set it in the store, so we can keep the state if it was ever enabled
         if versioning_status := request.get("VersioningConfiguration", {}).get("Status"):
             bucket_name = request["Bucket"]
-            store = self.get_store()
+            store = self.get_store(context)
             store.bucket_versioning_status[bucket_name] = versioning_status == "Enabled"
 
     def put_bucket_notification_configuration(
@@ -1022,7 +1279,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         self._verify_notification_configuration(
             notification_configuration, skip_destination_validation, context, bucket
         )
-        self.get_store().bucket_notification_configs[bucket] = notification_configuration
+        self.get_store(context).bucket_notification_configs[bucket] = notification_configuration
 
     def get_bucket_notification_configuration(
         self, context: RequestContext, bucket: BucketName, expected_bucket_owner: AccountId = None
@@ -1030,7 +1287,9 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         # TODO how to verify expected_bucket_owner
         # check if the bucket exists
         get_bucket_from_moto(get_moto_s3_backend(context), bucket=bucket)
-        return self.get_store().bucket_notification_configs.get(bucket, NotificationConfiguration())
+        return self.get_store(context).bucket_notification_configs.get(
+            bucket, NotificationConfiguration()
+        )
 
     def get_bucket_website(
         self, context: RequestContext, bucket: BucketName, expected_bucket_owner: AccountId = None
@@ -1040,7 +1299,11 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket)
 
-        if not (website_configuration := self.get_store().bucket_website_configuration.get(bucket)):
+        if not (
+            website_configuration := self.get_store(context).bucket_website_configuration.get(
+                bucket
+            )
+        ):
             ex = NoSuchWebsiteConfiguration(
                 "The specified bucket does not have a website configuration"
             )
@@ -1064,7 +1327,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         get_bucket_from_moto(moto_backend, bucket)
 
         validate_website_configuration(website_configuration)
-        store = self.get_store()
+        store = self.get_store(context)
         store.bucket_website_configuration[bucket] = website_configuration
 
     def delete_bucket_website(
@@ -1075,7 +1338,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket)
         # does not raise error if the bucket did not have a config, will simply return
-        self.get_store().bucket_website_configuration.pop(bucket, None)
+        self.get_store(context).bucket_website_configuration.pop(bucket, None)
 
     def post_object(
         self, context: RequestContext, bucket: BucketName, body: IO[Body] = None
@@ -1127,7 +1390,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             "LocationHeader", f"{get_full_default_bucket_location(bucket)}{key_name}"
         )
 
-        if bucket in self.get_store().bucket_versioning_status:
+        if bucket in self.get_store(context).bucket_versioning_status:
             response["VersionId"] = key.version_id
 
         self._notify(context, key_name=key_name)
@@ -1168,17 +1431,13 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         if "ObjectSize" in object_attrs:
             response["ObjectSize"] = key.size
         if "Checksum" in object_attrs and (checksum_algorithm := key.checksum_algorithm):
-            # TODO: moto does not store the checksum of object, there is a TODO there as well
-            # in the meantime, just compute the hash everytime it's requested
-            checksum = get_object_checksum_for_algorithm(
-                checksum_algorithm=checksum_algorithm,
-                data=key.value,
-            )
-            response["Checksum"] = {f"Checksum{checksum_algorithm.upper()}": checksum}  # noqa
+            response["Checksum"] = {
+                f"Checksum{checksum_algorithm.upper()}": key.checksum_value
+            }  # noqa
 
         response["LastModified"] = key.last_modified
 
-        if bucket_name in self.get_store().bucket_versioning_status:
+        if bucket_name in self.get_store(context).bucket_versioning_status:
             response["VersionId"] = key.version_id
 
         if key.multipart:
@@ -1199,7 +1458,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket)
 
-        store = self.get_store()
+        store = self.get_store(context)
 
         validate_bucket_analytics_configuration(
             id=id, analytics_configuration=analytics_configuration
@@ -1220,7 +1479,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket)
 
-        store = self.get_store()
+        store = self.get_store(context)
 
         analytics_configuration: AnalyticsConfiguration = store.bucket_analytics_configuration.get(
             bucket, {}
@@ -1239,7 +1498,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket)
 
-        store = self.get_store()
+        store = self.get_store(context)
         analytics_configurations: Dict[
             AnalyticsId, AnalyticsConfiguration
         ] = store.bucket_analytics_configuration.get(bucket, {})
@@ -1260,7 +1519,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket)
 
-        store = self.get_store()
+        store = self.get_store(context)
         analytics_configurations = store.bucket_analytics_configuration.get(bucket, {})
         if not analytics_configurations.pop(id, None):
             raise NoSuchConfiguration("The specified configuration does not exist.")
@@ -1277,7 +1536,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
 
         validate_bucket_intelligent_tiering_configuration(id, intelligent_tiering_configuration)
 
-        store = self.get_store()
+        store = self.get_store(context)
         bucket_intelligent_tiering_configurations = (
             store.bucket_intelligent_tiering_configuration.setdefault(bucket, {})
         )
@@ -1289,7 +1548,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket)
 
-        store = self.get_store()
+        store = self.get_store(context)
         intelligent_tiering_configuration: IntelligentTieringConfiguration = (
             store.bucket_intelligent_tiering_configuration.get(bucket, {}).get(id)
         )
@@ -1305,7 +1564,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket)
 
-        store = self.get_store()
+        store = self.get_store(context)
         bucket_intelligent_tiering_configurations = (
             store.bucket_intelligent_tiering_configuration.get(bucket, {})
         )
@@ -1318,7 +1577,7 @@ class S3Provider(S3Api, ServiceLifecycleHook):
         moto_backend = get_moto_s3_backend(context)
         get_bucket_from_moto(moto_backend, bucket)
 
-        store = self.get_store()
+        store = self.get_store(context)
         bucket_intelligent_tiering_configurations: Dict[
             IntelligentTieringId, IntelligentTieringConfiguration
         ] = store.bucket_intelligent_tiering_configuration.get(bucket, {})
@@ -1331,184 +1590,165 @@ class S3Provider(S3Api, ServiceLifecycleHook):
             IntelligentTieringConfigurationList=bucket_intelligent_tiering_configurations,
         )
 
+    def put_bucket_logging(
+        self,
+        context: RequestContext,
+        bucket: BucketName,
+        bucket_logging_status: BucketLoggingStatus,
+        content_md5: ContentMD5 = None,
+        checksum_algorithm: ChecksumAlgorithm = None,
+        expected_bucket_owner: AccountId = None,
+    ) -> None:
+        moto_backend = get_moto_s3_backend(context)
+        moto_bucket = get_bucket_from_moto(moto_backend, bucket)
 
-def validate_bucket_analytics_configuration(
-    id: AnalyticsId, analytics_configuration: AnalyticsConfiguration
-) -> None:
-    if id != analytics_configuration.get("Id"):
-        raise MalformedXML(
-            "The XML you provided was not well-formed or did not validate against our published schema"
-        )
+        if not (logging_config := bucket_logging_status.get("LoggingEnabled")):
+            moto_bucket.logging = {}
+            return
 
-
-def validate_bucket_intelligent_tiering_configuration(
-    id: IntelligentTieringId, intelligent_tiering_configuration: IntelligentTieringConfiguration
-) -> None:
-    if id != intelligent_tiering_configuration.get("Id"):
-        raise MalformedXML(
-            "The XML you provided was not well-formed or did not validate against our published schema"
-        )
-
-
-def validate_bucket_name(bucket: BucketName) -> None:
-    """
-    Validate s3 bucket name based on the documentation
-    ref. https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
-    """
-    if not is_bucket_name_valid(bucket_name=bucket):
-        ex = InvalidBucketName("The specified bucket is not valid.")
-        ex.BucketName = bucket
-        raise ex
-
-
-def validate_canned_acl(canned_acl: str) -> None:
-    """
-    Validate the canned ACL value, or raise an Exception
-    """
-    if canned_acl and not is_canned_acl_bucket_valid(canned_acl):
-        ex = _create_invalid_argument_exc(None, "x-amz-acl", canned_acl)
-        raise ex
-
-
-def validate_grantee_in_headers(grant: str, grantees: str) -> None:
-    splitted_grantees = [grantee.strip() for grantee in grantees.split(",")]
-    for grantee in splitted_grantees:
-        grantee_type, grantee_id = grantee.split("=")
-        grantee_id = grantee_id.strip('"')
-        if grantee_type not in ("uri", "id", "emailAddress"):
-            ex = _create_invalid_argument_exc(
-                "Argument format not recognized", get_header_name(grant), grantee
-            )
-            raise ex
-        elif grantee_type == "uri" and grantee_id not in s3_constants.VALID_ACL_PREDEFINED_GROUPS:
-            ex = _create_invalid_argument_exc("Invalid group uri", "uri", grantee_id)
-            raise ex
-        elif grantee_type == "id" and not is_valid_canonical_id(grantee_id):
-            ex = _create_invalid_argument_exc("Invalid id", "id", grantee_id)
-            raise ex
-        elif grantee_type == "emailAddress":
-            # TODO: check validation here
-            continue
-
-
-def validate_acl_acp(acp: AccessControlPolicy) -> None:
-    if acp is None or "Owner" not in acp or "Grants" not in acp:
-        raise MalformedACLError(
-            "The XML you provided was not well-formed or did not validate against our published schema"
-        )
-
-    if not is_valid_canonical_id(owner_id := acp["Owner"].get("ID", "")):
-        ex = _create_invalid_argument_exc("Invalid id", "CanonicalUser/ID", owner_id)
-        raise ex
-
-    for grant in acp["Grants"]:
-        if grant.get("Permission") not in s3_constants.VALID_GRANTEE_PERMISSIONS:
-            raise MalformedACLError(
-                "The XML you provided was not well-formed or did not validate against our published schema"
-            )
-
-        grantee = grant.get("Grantee", {})
-        grant_type = grantee.get("Type")
-        if grant_type not in (
-            GranteeType.Group,
-            GranteeType.CanonicalUser,
-            GranteeType.AmazonCustomerByEmail,
-        ):
-            raise MalformedACLError(
-                "The XML you provided was not well-formed or did not validate against our published schema"
-            )
-        elif (
-            grant_type == GranteeType.Group
-            and (grant_uri := grantee.get("URI", ""))
-            not in s3_constants.VALID_ACL_PREDEFINED_GROUPS
-        ):
-            ex = _create_invalid_argument_exc("Invalid group uri", "Group/URI", grant_uri)
-            raise ex
-
-        elif grant_type == GranteeType.AmazonCustomerByEmail:
-            # TODO: add validation here
-            continue
-
-        elif grant_type == GranteeType.CanonicalUser and not is_valid_canonical_id(
-            (grantee_id := grantee.get("ID", ""))
-        ):
-            ex = _create_invalid_argument_exc("Invalid id", "CanonicalUser/ID", grantee_id)
-            raise ex
-
-
-def validate_website_configuration(website_config: WebsiteConfiguration) -> None:
-    """
-    Validate the website configuration following AWS docs
-    See https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketWebsite.html
-    :param website_config:
-    :raises
-    :return: None
-    """
-    if redirect_all_req := website_config.get("RedirectAllRequestsTo", {}):
-        if len(website_config) > 1:
-            ex = _create_invalid_argument_exc(
-                message="RedirectAllRequestsTo cannot be provided in conjunction with other Routing Rules.",
-                name="RedirectAllRequestsTo",
-                value="not null",
-            )
-            raise ex
-        if "HostName" not in redirect_all_req:
+        # the target bucket must be in the same account
+        if not (target_bucket_name := logging_config.get("TargetBucket")):
             raise MalformedXML()
 
-        if (protocol := redirect_all_req.get("Protocol")) and protocol not in ("http", "https"):
-            raise InvalidRequest(
-                "Invalid protocol, protocol can be http or https. If not defined the protocol will be selected automatically."
+        if not logging_config.get("TargetPrefix"):
+            logging_config["TargetPrefix"] = ""
+
+        # TODO: validate Grants
+
+        if not (target_bucket := moto_backend.buckets.get(target_bucket_name)):
+            raise InvalidTargetBucketForLogging(
+                "The target bucket for logging does not exist",
+                TargetBucket=target_bucket_name,
             )
 
-        return
+        if target_bucket.region_name != moto_bucket.region_name:
+            raise CrossLocationLoggingProhibitted(
+                "Cross S3 location logging not allowed. ",
+                TargetBucketLocation=target_bucket.region_name,
+            )
 
-    # required
-    # https://docs.aws.amazon.com/AmazonS3/latest/API/API_IndexDocument.html
-    if not (index_configuration := website_config.get("IndexDocument")):
-        ex = _create_invalid_argument_exc(
-            message="A value for IndexDocument Suffix must be provided if RedirectAllRequestsTo is empty",
-            name="IndexDocument",
-            value="null",
+        moto_bucket.logging = logging_config
+
+    def get_bucket_logging(
+        self, context: RequestContext, bucket: BucketName, expected_bucket_owner: AccountId = None
+    ) -> GetBucketLoggingOutput:
+        moto_backend = get_moto_s3_backend(context)
+        moto_bucket = get_bucket_from_moto(moto_backend, bucket)
+        if not moto_bucket.logging:
+            return GetBucketLoggingOutput()
+
+        return GetBucketLoggingOutput(LoggingEnabled=moto_bucket.logging)
+
+    def select_object_content(
+        self,
+        context: RequestContext,
+        bucket: BucketName,
+        key: ObjectKey,
+        expression: Expression,
+        expression_type: ExpressionType,
+        input_serialization: InputSerialization,
+        output_serialization: OutputSerialization,
+        sse_customer_algorithm: SSECustomerAlgorithm = None,
+        sse_customer_key: SSECustomerKey = None,
+        sse_customer_key_md5: SSECustomerKeyMD5 = None,
+        request_progress: RequestProgress = None,
+        scan_range: ScanRange = None,
+        expected_bucket_owner: AccountId = None,
+    ) -> SelectObjectContentOutput:
+        # this operation is currently implemented by moto, but raises a 500 error because of the format necessary,
+        # and streaming capability.
+        # avoid a fallback to moto and return the 501 to the client directly instead.
+        raise NotImplementedAvoidFallbackError
+
+    @handler("RestoreObject", expand=False)
+    def restore_object(
+        self,
+        context: RequestContext,
+        request: RestoreObjectRequest,
+    ) -> RestoreObjectOutput:
+        response: RestoreObjectOutput = call_moto(context)
+        # We first create a context when we initiated the Restore process
+        s3_notif_ctx_initiated = S3EventNotificationContext.from_request_context(context)
+        self._notify(context, s3_notif_ctx_initiated)
+        # But because it's instant in LocalStack, we can directly send the Completed notification as well
+        # We just need to copy the context so that we don't mutate the first context while it could be sent
+        # And modify its event type from `ObjectRestore:Post` to `ObjectRestore:Completed`
+        s3_notif_ctx_completed = copy.copy(s3_notif_ctx_initiated)
+        s3_notif_ctx_completed.event_type = s3_notif_ctx_completed.event_type.replace(
+            "Post", "Completed"
         )
-        raise ex
+        self._notify(context, s3_notif_ctx_completed)
+        return response
 
-    if not (index_suffix := index_configuration.get("Suffix")) or "/" in index_suffix:
-        ex = _create_invalid_argument_exc(
-            message="The IndexDocument Suffix is not well formed",
-            name="IndexDocument",
-            value=index_suffix or None,
+    def put_bucket_inventory_configuration(
+        self,
+        context: RequestContext,
+        bucket: BucketName,
+        id: InventoryId,
+        inventory_configuration: InventoryConfiguration,
+        expected_bucket_owner: AccountId = None,
+    ) -> None:
+        moto_backend = get_moto_s3_backend(context)
+        get_bucket_from_moto(moto_backend, bucket)
+
+        validate_inventory_configuration(
+            config_id=id, inventory_configuration=inventory_configuration
         )
-        raise ex
 
-    if "ErrorDocument" in website_config and not website_config.get("ErrorDocument", {}).get("Key"):
-        raise MalformedXML()
+        store = self.get_store(context)
+        inventory_configurations = store.bucket_inventory_configurations.setdefault(bucket, {})
+        inventory_configurations[id] = inventory_configuration
 
-    if "RoutingRules" in website_config:
-        routing_rules = website_config.get("RoutingRules", [])
-        if len(routing_rules) == 0:
-            raise MalformedXML()
-        if len(routing_rules) > 50:
-            raise "Something?"
-        for routing_rule in routing_rules:
-            redirect = routing_rule.get("Redirect", {})
-            # todo: this does not raise an error? check what GetWebsiteConfig returns? empty field?
-            # if not (redirect := routing_rule.get("Redirect")):
-            #     raise "Something"
+    def get_bucket_inventory_configuration(
+        self,
+        context: RequestContext,
+        bucket: BucketName,
+        id: InventoryId,
+        expected_bucket_owner: AccountId = None,
+    ) -> GetBucketInventoryConfigurationOutput:
+        moto_backend = get_moto_s3_backend(context)
+        get_bucket_from_moto(moto_backend, bucket)
 
-            if "ReplaceKeyPrefixWith" in redirect and "ReplaceKeyWith" in redirect:
-                raise InvalidRequest(
-                    "You can only define ReplaceKeyPrefix or ReplaceKey but not both."
-                )
+        store = self.get_store(context)
+        inventory_configuration = store.bucket_inventory_configurations.get(bucket, {}).get(id)
+        if not inventory_configuration:
+            raise NoSuchConfiguration("The specified configuration does not exist.")
+        return GetBucketInventoryConfigurationOutput(InventoryConfiguration=inventory_configuration)
 
-            if "Condition" in routing_rule and not routing_rule.get("Condition", {}):
-                raise InvalidRequest(
-                    "Condition cannot be empty. To redirect all requests without a condition, the condition element shouldn't be present."
-                )
+    def list_bucket_inventory_configurations(
+        self,
+        context: RequestContext,
+        bucket: BucketName,
+        continuation_token: Token = None,
+        expected_bucket_owner: AccountId = None,
+    ) -> ListBucketInventoryConfigurationsOutput:
+        moto_backend = get_moto_s3_backend(context)
+        get_bucket_from_moto(moto_backend, bucket)
 
-            if (protocol := redirect.get("Protocol")) and protocol not in ("http", "https"):
-                raise InvalidRequest(
-                    "Invalid protocol, protocol can be http or https. If not defined the protocol will be selected automatically."
-                )
+        store = self.get_store(context)
+        bucket_inventory_configurations = store.bucket_inventory_configurations.get(bucket, {})
+
+        return ListBucketInventoryConfigurationsOutput(
+            IsTruncated=False,
+            InventoryConfigurationList=sorted(
+                bucket_inventory_configurations.values(), key=itemgetter("Id")
+            ),
+        )
+
+    def delete_bucket_inventory_configuration(
+        self,
+        context: RequestContext,
+        bucket: BucketName,
+        id: InventoryId,
+        expected_bucket_owner: AccountId = None,
+    ) -> None:
+        moto_backend = get_moto_s3_backend(context)
+        get_bucket_from_moto(moto_backend, bucket)
+
+        store = self.get_store(context)
+        bucket_inventory_configurations = store.bucket_inventory_configurations.get(bucket, {})
+        if not bucket_inventory_configurations.pop(id, None):
+            raise NoSuchConfiguration("The specified configuration does not exist.")
 
 
 def is_object_expired(
@@ -1637,6 +1877,8 @@ def apply_moto_patches():
         """
         try:
             tags: Dict[str, str] = fn(*args, **kwargs)
+            for key in tags:
+                tags[key] = tags[key] if tags[key] else ""
         except TypeError:
             tags = {}
         return tags
@@ -1685,6 +1927,23 @@ def apply_moto_patches():
             return PermissionResult.PERMITTED
 
         return fn(self, *args, **kwargs)
+
+    def key_is_locked(self):
+        """
+        Apply a patch to check if a key is locked
+        """
+        if self.lock_legal_status == "ON":
+            return True
+
+        if self.lock_mode in ["GOVERNANCE", "COMPLIANCE"]:
+            now = datetime.datetime.utcnow()
+            until = parse_timestamp(self.lock_until)
+            if until > now:
+                return True
+
+        return False
+
+    setattr(moto_s3_models.FakeKey, "is_locked", property(key_is_locked))
 
 
 def register_custom_handlers():

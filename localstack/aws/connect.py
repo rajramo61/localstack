@@ -21,7 +21,6 @@ from localstack.constants import (
     INTERNAL_AWS_ACCESS_KEY_ID,
     INTERNAL_AWS_SECRET_ACCESS_KEY,
     MAX_POOL_CONNECTIONS,
-    TEST_AWS_ACCESS_KEY_ID,
     TEST_AWS_SECRET_ACCESS_KEY,
 )
 from localstack.utils.aws.aws_stack import get_local_service_url, get_s3_hostname
@@ -35,14 +34,14 @@ LOG = logging.getLogger(__name__)
 def attribute_name_to_service_name(attribute_name):
     """
     Converts a python-compatible attribute name to the boto service name
-    :param attribute_name: Python compatible attribute name. In essential the service name, if it is a python keyword
-        prefixed by `aws`, and all `-` replaced by `_`.
+    :param attribute_name: Python compatible attribute name using the following replacements:
+                            a) Add an underscore suffix `_` to any reserved Python keyword (PEP-8).
+                            b) Replace any dash `-` with an underscore `_`
     :return:
     """
-    if attribute_name.startswith("aws"):
-        # remove aws prefix for services named like a keyword.
-        # Most notably, "awslambda" -> "lambda"
-        attribute_name = attribute_name[3:]
+    if attribute_name.endswith("_"):
+        # lambda_ -> lambda
+        attribute_name = attribute_name[:-1]
     # replace all _ with -: cognito_idp -> cognito-idp
     return attribute_name.replace("_", "-")
 
@@ -141,6 +140,11 @@ class ServiceLevelClientFactory(TypedServiceClientFactory):
     ):
         self._factory = factory
         self._client_creation_params = client_creation_params
+
+    def get_client(self, service: str):
+        return MetadataRequestInjector(
+            client=self._factory.get_client(service_name=service, **self._client_creation_params)
+        )
 
     def __getattr__(self, service: str):
         service = attribute_name_to_service_name(service)
@@ -447,9 +451,9 @@ class ExternalClientFactory(ClientFactory):
         :param region_name: Name of the AWS region to be associated with the client
             If set to None, loads from botocore session.
         :param aws_access_key_id: Access key to use for the client.
-            Defaults to dummy value ("test")
+            If set to None, loads from botocore session.
         :param aws_secret_access_key: Secret key to use for the client.
-            Defaults to "dummy value ("test")
+            If set to None, uses a placeholder value
         :param aws_session_token: Session token to use for the client.
             Not being used if not set.
         :param endpoint_url: Full endpoint URL to be used by the client.
@@ -466,14 +470,19 @@ class ExternalClientFactory(ClientFactory):
             if re.match(r"https?://localhost(:[0-9]+)?", endpoint_url):
                 endpoint_url = endpoint_url.replace("://localhost", f"://{get_s3_hostname()}")
 
+        # Prevent `PartialCredentialsError` when only access key ID is provided
+        # The value of secret access key is insignificant and can be set to anything
+        if aws_access_key_id:
+            aws_secret_access_key = aws_secret_access_key or TEST_AWS_SECRET_ACCESS_KEY
+
         return self._get_client(
             service_name=service_name,
             region_name=region_name or config.region_name or self._get_region(),
             use_ssl=self._use_ssl,
             verify=self._verify,
             endpoint_url=endpoint_url,
-            aws_access_key_id=aws_access_key_id or TEST_AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=aws_secret_access_key or TEST_AWS_SECRET_ACCESS_KEY,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
             aws_session_token=aws_session_token,
             config=config,
         )

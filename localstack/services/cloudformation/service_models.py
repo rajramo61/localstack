@@ -1,6 +1,7 @@
 import logging
 from typing import Optional, TypedDict
 
+from localstack.services.cloudformation.deployment_utils import check_not_found_exception
 from localstack.utils.aws import aws_stack
 
 LOG = logging.getLogger(__name__)
@@ -77,48 +78,33 @@ class GenericBaseModel:
         """Set any defaults required, including auto-generating names. Must be called before deploying the resource"""
         pass
 
-    # ----------------------
-    # GENERIC BASE METHODS
-    # ----------------------
-
-    def get_cfn_attribute(self, attribute_name):
-        """Retrieve the given CF attribute for this resource"""
-        return self.props.get(attribute_name)
-
-    # TODO: make this stricter
-    def get_ref(self):
-        return self.physical_resource_id
-
     # ---------------------
     # GENERIC UTIL METHODS
     # ---------------------
 
     # TODO: remove
     def fetch_and_update_state(self, *args, **kwargs):
-        from localstack.services.cloudformation.engine import template_deployer
+        if self.physical_resource_id is None:
+            return None
 
         try:
             state = self.fetch_state(*args, **kwargs)
             self.update_state(state)
             return state
         except Exception as e:
-            if not template_deployer.check_not_found_exception(
-                e, self.resource_type, self.properties
-            ):
-                LOG.debug("Unable to fetch state for resource %s: %s", self, e)
-
-    # TODO: remove
-    def fetch_state_if_missing(self, *args, **kwargs):
-        if not self.state:
-            self.fetch_and_update_state(*args, **kwargs)
-        return self.state
+            if not check_not_found_exception(e, self.resource_type, self.properties):
+                LOG.warning(
+                    "Unable to fetch state for resource %s: %s",
+                    self,
+                    e,
+                    exc_info=LOG.isEnabledFor(logging.DEBUG),
+                )
 
     # TODO: remove
     def update_state(self, details):
         """Update the deployment state of this resource (existing attributes will be overwritten)."""
         details = details or {}
         self.state.update(details)
-        return self.props
 
     @property
     def physical_resource_id(self) -> str | None:

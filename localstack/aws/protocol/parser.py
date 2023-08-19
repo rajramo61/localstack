@@ -233,7 +233,7 @@ class RequestParser(abc.ABC):
             if location == "header":
                 header_name = shape.serialization.get("name")
                 payload = request.headers.get(header_name)
-                if shape.type_name == "list":
+                if payload and shape.type_name == "list":
                     # headers may contain a comma separated list of values (e.g., the ObjectAttributes member in
                     # s3.GetObjectAttributes), so we prepare it here for the handler, which will be `_parse_list`.
                     payload = payload.split(",")
@@ -1047,7 +1047,7 @@ class S3RequestParser(RestXMLRequestParser):
 
         @staticmethod
         def _is_vhost_address(request: HttpRequest) -> bool:
-            from localstack.services.s3.s3_utils import uses_host_addressing
+            from localstack.services.s3.utils import uses_host_addressing
 
             return uses_host_addressing(request.headers)
 

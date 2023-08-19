@@ -5,6 +5,7 @@ import re
 from copy import deepcopy
 from typing import Callable, List
 
+from localstack import config
 from localstack.utils import common
 from localstack.utils.aws import aws_stack
 from localstack.utils.common import select_attributes, short_uid
@@ -20,8 +21,8 @@ LOG = logging.getLogger(__name__)
 
 
 def dump_json_params(param_func=None, *param_names):
-    def replace(params, **kwargs):
-        result = param_func(params, **kwargs) if param_func else params
+    def replace(params, logical_resource_id, *args, **kwargs):
+        result = param_func(params, logical_resource_id, *args, **kwargs) if param_func else params
         for name in param_names:
             if isinstance(result.get(name), (dict, list)):
                 # Fix for https://github.com/localstack/localstack/issues/2022
@@ -33,9 +34,10 @@ def dump_json_params(param_func=None, *param_names):
     return replace
 
 
+# TODO: remove
 def param_defaults(param_func, defaults):
-    def replace(params, **kwargs):
-        result = param_func(params, **kwargs)
+    def replace(properties: dict, logical_resource_id: str, *args, **kwargs):
+        result = param_func(properties, logical_resource_id, *args, **kwargs)
         for key, value in defaults.items():
             if result.get(key) in ["", None]:
                 result[key] = value
@@ -62,7 +64,7 @@ def remove_none_values(params):
 
 
 def params_list_to_dict(param_name, key_attr_name="Key", value_attr_name="Value"):
-    def do_replace(params, **kwargs):
+    def do_replace(params, logical_resource_id, *args, **kwargs):
         result = {}
         for entry in params.get(param_name, []):
             key = entry[key_attr_name]
@@ -74,14 +76,15 @@ def params_list_to_dict(param_name, key_attr_name="Key", value_attr_name="Value"
 
 
 def lambda_keys_to_lower(key=None, skip_children_of: List[str] = None):
-    return lambda params, **kwargs: common.keys_to_lower(
+    return lambda params, logical_resource_id, *args, **kwargs: common.keys_to_lower(
         obj=(params.get(key) if key else params), skip_children_of=skip_children_of
     )
 
 
 def merge_parameters(func1, func2):
-    return lambda params, **kwargs: common.merge_dicts(
-        func1(params, **kwargs), func2(params, **kwargs)
+    return lambda properties, logical_resource_id, *args, **kwargs: common.merge_dicts(
+        func1(properties, logical_resource_id, *args, **kwargs),
+        func2(properties, logical_resource_id, *args, **kwargs),
     )
 
 
@@ -90,7 +93,7 @@ def str_or_none(o):
 
 
 def params_dict_to_list(param_name, key_attr_name="Key", value_attr_name="Value", wrapper=None):
-    def do_replace(params, **kwargs):
+    def do_replace(params, logical_resource_id, *args, **kwargs):
         result = []
         for key, value in params.get(param_name, {}).items():
             result.append({key_attr_name: key, value_attr_name: value})
@@ -101,8 +104,9 @@ def params_dict_to_list(param_name, key_attr_name="Key", value_attr_name="Value"
     return do_replace
 
 
+# TODO: remove
 def params_select_attributes(*attrs):
-    def do_select(params, **kwargs):
+    def do_select(params, logical_resource_id, *args, **kwargs):
         result = {}
         for attr in attrs:
             if params.get(attr) is not None:
@@ -113,7 +117,7 @@ def params_select_attributes(*attrs):
 
 
 def param_json_to_str(name):
-    def _convert(params, **kwargs):
+    def _convert(params, logical_resource_id, *args, **kwargs):
         result = params.get(name)
         if result:
             result = json.dumps(result)
@@ -128,7 +132,9 @@ def lambda_select_params(*selected):
 
 
 def select_parameters(*param_names):
-    return lambda params, **kwargs: select_attributes(params, param_names)
+    return lambda properties, logical_resource_id, *args, **kwargs: select_attributes(
+        properties, param_names
+    )
 
 
 def is_none_or_empty_value(value):
@@ -146,18 +152,6 @@ def generate_default_name_without_stack(logical_resource_id: str):
     random_id_part = short_uid()
     resource_id_part = logical_resource_id[: 63 - 1 - len(random_id_part)]
     return f"{resource_id_part}-{random_id_part}"
-
-
-def pre_create_default_name(key: str) -> Callable[[str, dict, str, dict, str], None]:
-    def _pre_create_default_name(
-        resource_id: str, resources: dict, resource_type: str, func: dict, stack_name: str
-    ):
-        resource = resources[resource_id]
-        props = resource["Properties"]
-        if not props.get(key):
-            props[key] = generate_default_name(stack_name, resource_id)
-
-    return _pre_create_default_name
 
 
 # Utils for parameter conversion
@@ -198,7 +192,6 @@ def fix_boto_parameters_based_on_report(original_params: dict, report: str) -> d
         cast_class = getattr(builtins, valid_class)
         old_value = get_nested(params, param_name)
 
-        new_value = None
         if cast_class == bool and str(old_value).lower() in ["true", "false"]:
             new_value = str(old_value).lower() == "true"
         else:
@@ -261,3 +254,32 @@ def dump_resource_as_json(resource: dict) -> str:
 
 def get_action_name_for_resource_change(res_change: str) -> str:
     return {"Add": "CREATE", "Remove": "DELETE", "Modify": "UPDATE"}.get(res_change)
+
+
+def check_not_found_exception(e, resource_type, resource, resource_status=None):
+    # we expect this to be a "not found" exception
+    markers = [
+        "NoSuchBucket",
+        "ResourceNotFound",
+        "NoSuchEntity",
+        "NotFoundException",
+        "404",
+        "not found",
+        "not exist",
+    ]
+
+    markers_hit = [m for m in markers if m in str(e)]
+    if not markers_hit:
+        LOG.warning(
+            "Unexpected error processing resource type %s: Exception: %s - %s - status: %s",
+            resource_type,
+            str(e),
+            resource,
+            resource_status,
+        )
+        if config.CFN_VERBOSE_ERRORS:
+            raise e
+        else:
+            return False
+
+    return True
